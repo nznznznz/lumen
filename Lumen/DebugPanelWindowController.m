@@ -98,6 +98,7 @@ NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPane
     [self addColumn:@"brightness" title:@"Brightness" width:85];
     [self addColumn:@"target" title:@"Target" width:70];
     [self addColumn:@"action" title:@"Action" width:140];
+    [self addColumn:@"actionReason" title:@"Skip Reason" width:180];
     [self addColumn:@"model" title:@"Model" width:105];
     [self addColumn:@"lastLearn" title:@"Last Learn" width:135];
     tableScrollView.documentView = self.displayTable;
@@ -236,7 +237,13 @@ NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPane
         NSString *display = event[@"display"] ?: @"";
         NSString *debugKey = event[@"debugKey"] ?: @"";
         NSString *prefix = display.length > 0 ? [NSString stringWithFormat:@"%@ [%@]", display, debugKey] : @"global";
-        [lines addObject:[NSString stringWithFormat:@"%@  %@  %@", event[@"time"] ?: @"", prefix, event[@"event"] ?: @""]];
+        NSString *reason = event[@"reason"];
+        NSString *decisionSuffix = reason.length > 0 ? [NSString stringWithFormat:@" reason=%@", reason] : @"";
+        [lines addObject:[NSString stringWithFormat:@"%@  %@  %@%@",
+                          event[@"time"] ?: @"",
+                          prefix,
+                          event[@"event"] ?: @"",
+                          decisionSuffix]];
     }
     self.eventTextView.string = lines.count > 0 ? [lines componentsJoinedByString:@"\n"] : @"No events yet";
 }

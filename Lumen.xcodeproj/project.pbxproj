@@ -13,6 +13,8 @@
 		F802B9F01AD81FB700FCFD65 /* MainMenu.xib in Resources */ = {isa = PBXBuildFile; fileRef = F802B9EE1AD81FB700FCFD65 /* MainMenu.xib */; };
 		F80722861E6BD17F000C3ECE /* NSArray+Functional.m in Sources */ = {isa = PBXBuildFile; fileRef = F80722851E6BD17F000C3ECE /* NSArray+Functional.m */; };
 		F81CA5162E01822800B61C2C /* DisplayServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F81CA5152E01822800B61C2C /* DisplayServices.framework */; };
+		F8A10C052E02C00000D15A1A /* CoreDisplay.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F8A10C072E02C00000D15A1A /* CoreDisplay.framework */; };
+		F8A10C062E02C00000D15A1A /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F8A10C082E02C00000D15A1A /* IOKit.framework */; };
 		F825A7A81E6B984300106611 /* stats.m in Sources */ = {isa = PBXBuildFile; fileRef = F825A7A71E6B984300106611 /* stats.m */; };
 		F83E30F71AD8252D0098C5CC /* BrightnessController.m in Sources */ = {isa = PBXBuildFile; fileRef = F83E30F61AD8252D0098C5CC /* BrightnessController.m */; };
 		F83E30FB1AD836F10098C5CC /* util.c in Sources */ = {isa = PBXBuildFile; fileRef = F83E30F91AD836F10098C5CC /* util.c */; };
@@ -36,6 +38,8 @@
 		F80722841E6BD17F000C3ECE /* NSArray+Functional.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = "NSArray+Functional.h"; sourceTree = "<group>"; };
 		F80722851E6BD17F000C3ECE /* NSArray+Functional.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = "NSArray+Functional.m"; sourceTree = "<group>"; };
 		F81CA5152E01822800B61C2C /* DisplayServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = DisplayServices.framework; path = ../../../../../../System/Library/PrivateFrameworks/DisplayServices.framework; sourceTree = "<group>"; };
+		F8A10C072E02C00000D15A1A /* CoreDisplay.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreDisplay.framework; path = /System/Library/Frameworks/CoreDisplay.framework; sourceTree = "<absolute>"; };
+		F8A10C082E02C00000D15A1A /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = /System/Library/Frameworks/IOKit.framework; sourceTree = "<absolute>"; };
 		F825A7A71E6B984300106611 /* stats.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = stats.m; sourceTree = "<group>"; };
 		F825A7A91E6B984C00106611 /* stats.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = stats.h; sourceTree = "<group>"; };
 		F83E30F41AD823640098C5CC /* Constants.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = Constants.h; sourceTree = "<group>"; };
@@ -61,6 +65,8 @@
 		F802B9DF1AD81FB700FCFD65 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				F8A10C062E02C00000D15A1A /* IOKit.framework in Frameworks */,
+				F8A10C052E02C00000D15A1A /* CoreDisplay.framework in Frameworks */,
 				F81CA5162E01822800B61C2C /* DisplayServices.framework in Frameworks */,
 			);
 		};
@@ -129,6 +135,8 @@
 		F81CA5142E01822800B61C2C /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				F8A10C082E02C00000D15A1A /* IOKit.framework */,
+				F8A10C072E02C00000D15A1A /* CoreDisplay.framework */,
 				F81CA5152E01822800B61C2C /* DisplayServices.framework */,
 			);
 			name = Frameworks;

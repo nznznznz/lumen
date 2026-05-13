@@ -8,6 +8,7 @@
 #import "Constants.h"
 #import "util.h"
 #import <IOKit/graphics/IOGraphicsLib.h>
+#import <IOKit/i2c/IOI2CInterface.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <AppKit/AppKit.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
@@ -15,6 +16,13 @@
 
 extern int DisplayServicesGetBrightness(CGDirectDisplayID display, float *brightness);
 extern int DisplayServicesSetBrightness(CGDirectDisplayID display, float brightness);
+
+typedef CFTypeRef IOAVService;
+extern IOAVService IOAVServiceCreateWithService(CFAllocatorRef allocator, io_service_t service);
+extern IOReturn IOAVServiceReadI2C(IOAVService service, uint32_t chipAddress, uint32_t offset, void *outputBuffer, uint32_t outputBufferSize);
+extern IOReturn IOAVServiceWriteI2C(IOAVService service, uint32_t chipAddress, uint32_t dataAddress, void *inputBuffer, uint32_t inputBufferSize);
+extern CFDictionaryRef CoreDisplay_DisplayCreateInfoDictionary(CGDirectDisplayID display);
+extern void CGSServiceForDisplayNumber(CGDirectDisplayID display, io_service_t *service);
 
 static NSString * const LumenBrightnessErrorDomain = @"com.anishathalye.lumen.brightness";
 static NSUInteger const LumenMaxDebugEvents = 50;
@@ -36,12 +44,32 @@ static os_log_t LumenDebugLog(void) {
 - (float)brightnessForDisplay:(LumenDisplay *)display error:(NSError **)error;
 - (BOOL)setBrightness:(float)brightness forDisplay:(LumenDisplay *)display error:(NSError **)error;
 
+@optional
+- (NSString *)failureReasonForDisplay:(LumenDisplay *)display;
+
 @end
 
 @interface DisplayServicesBrightnessBackend : NSObject <LumenBrightnessBackend>
 @end
 
+@class LumenDDCMapping;
+
 @interface ExternalDisplayBrightnessBackend : NSObject <LumenBrightnessBackend>
+
+@property (nonatomic, strong) NSMutableDictionary<NSString *, LumenDDCMapping *> *mappingsByDisplayKey;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *failuresByDisplayKey;
+
+@end
+
+@interface LumenDDCMapping : NSObject
+
+@property (nonatomic, assign) BOOL arm64;
+@property (nonatomic, assign) IOAVService avService;
+@property (nonatomic, assign) io_service_t framebuffer;
+@property (nonatomic, assign) IOOptionBits replyTransactionType;
+@property (nonatomic, assign) UInt16 maxBrightness;
+@property (nonatomic, copy) NSString *failureReason;
+
 @end
 
 @interface LumenDisplayState : NSObject
@@ -151,8 +179,15 @@ static os_log_t LumenDebugLog(void) {
 - (void)processLightness:(double)lightness forDisplay:(LumenDisplay *)display;
 - (double)computeLightnessFromSampleBuffer:(CMSampleBufferRef)sampleBuffer;
 - (void)addDebugEvent:(NSString *)event display:(LumenDisplay *)display;
+- (void)addSkippedDecisionEventForDisplay:(LumenDisplay *)display
+                                    state:(LumenDisplayState *)state
+                                lightness:(double)lightness
+                                   target:(float)target
+                        currentBrightness:(float)currentBrightness
+                                   reason:(NSString *)reason;
 - (void)setAction:(NSString *)action reason:(NSString *)reason display:(LumenDisplay *)display state:(LumenDisplayState *)state;
 - (NSDictionary<NSString *, id> *)debugDictionaryForDisplay:(LumenDisplay *)display;
+- (NSString *)brightnessFailureReasonForDisplay:(LumenDisplay *)display;
 - (NSString *)shortDisplayKey:(NSString *)stableKey;
 - (NSString *)roleForDisplay:(LumenDisplay *)display;
 - (NSString *)formattedTime:(NSTimeInterval)timestamp;
@@ -167,6 +202,46 @@ static void LumenDisplayReconfigurationCallback(CGDirectDisplayID display,
         os_log_info(LumenDebugLog(), "Display reconfiguration display=%{public}u flags=%{public}u", display, flags);
         [controller reloadDisplaysAndStreams];
     });
+}
+
+@implementation LumenDDCMapping
+
+- (void)dealloc {
+    if (_avService) {
+        CFRelease(_avService);
+    }
+    if (_framebuffer) {
+        IOObjectRelease(_framebuffer);
+    }
+}
+
+@end
+
+static UInt8 LumenDDCChecksum(UInt8 seed, UInt8 *data, NSUInteger length) {
+    UInt8 checksum = seed;
+    for (NSUInteger i = 0; i < length; i++) {
+        checksum ^= data[i];
+    }
+    return checksum;
+}
+
+static NSError *LumenBrightnessError(NSInteger code, NSString *message) {
+    return [NSError errorWithDomain:LumenBrightnessErrorDomain
+                               code:code
+                           userInfo:@{NSLocalizedDescriptionKey: message ?: @"brightness backend failed"}];
+}
+
+static BOOL LumenIsArm64(void) {
+#if defined(__arm64__)
+    return YES;
+#else
+    return NO;
+#endif
+}
+
+static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char *key) {
+    id value = dictionary[@(key)];
+    return [value isKindOfClass:[NSNumber class]] ? value : nil;
 }
 
 @implementation DisplayServicesBrightnessBackend
@@ -211,33 +286,542 @@ static void LumenDisplayReconfigurationCallback(CGDirectDisplayID display,
 
 @implementation ExternalDisplayBrightnessBackend
 
-// TODO: add a DDC/CI implementation here when the project has a documented
-// local backend. This intentionally does not call MonitorControl internals.
+// Minimal DDC/CI backend adapted from MonitorControl's MIT-licensed
+// IntelDDC.swift and Arm64DDC.swift packet/mapping approach.
+// Copyright (c) 2017 MonitorControl contributors.
+
+static UInt8 const LumenDDCVCPBrightness = 0x10;
+static UInt8 const LumenIntelDDCWriteAddress = 0x6E;
+static UInt8 const LumenIntelDDCReadAddress = 0x6F;
+static UInt8 const LumenDDCSubAddress = 0x51;
+static UInt8 const LumenArmDDC7BitAddress = 0x37;
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        self.mappingsByDisplayKey = [NSMutableDictionary new];
+        self.failuresByDisplayKey = [NSMutableDictionary new];
+    }
+    return self;
+}
 
 - (NSString *)name {
-    return @"ExternalDisplayBrightnessBackend";
+    return @"DDC-CI";
 }
 
 - (BOOL)canControlDisplay:(LumenDisplay *)display {
-    return NO;
+    if (display.builtin) {
+        return NO;
+    }
+
+    NSError *error = nil;
+    LumenDDCMapping *mapping = [self mappingForDisplay:display error:&error];
+    if (!mapping) {
+        self.failuresByDisplayKey[display.stableKey] = error.localizedDescription ?: @"no DDC/CI service found";
+        return NO;
+    }
+
+    UInt16 current = 0;
+    UInt16 maximum = 0;
+    if (![self readBrightnessCurrent:&current maximum:&maximum mapping:mapping error:&error]) {
+        self.failuresByDisplayKey[display.stableKey] = error.localizedDescription ?: @"brightness command unsupported";
+        [self.mappingsByDisplayKey removeObjectForKey:display.stableKey];
+        return NO;
+    }
+
+    mapping.maxBrightness = maximum > 0 ? maximum : 100;
+    self.failuresByDisplayKey[display.stableKey] = @"";
+    return YES;
 }
 
 - (float)brightnessForDisplay:(LumenDisplay *)display error:(NSError **)error {
-    if (error) {
-        *error = [NSError errorWithDomain:LumenBrightnessErrorDomain
-                                     code:-1
-                                 userInfo:@{NSLocalizedDescriptionKey: @"No external DDC/CI backend is implemented yet"}];
+    LumenDDCMapping *mapping = [self mappingForDisplay:display error:error];
+    if (!mapping) {
+        return 0;
     }
-    return 0;
+
+    UInt16 current = 0;
+    UInt16 maximum = 0;
+    if (![self readBrightnessCurrent:&current maximum:&maximum mapping:mapping error:error]) {
+        [self.mappingsByDisplayKey removeObjectForKey:display.stableKey];
+        return 0;
+    }
+
+    mapping.maxBrightness = maximum > 0 ? maximum : 100;
+    return MIN(1.0f, MAX(0.0f, (float)current / (float)mapping.maxBrightness));
 }
 
 - (BOOL)setBrightness:(float)brightness forDisplay:(LumenDisplay *)display error:(NSError **)error {
-    if (error) {
-        *error = [NSError errorWithDomain:LumenBrightnessErrorDomain
-                                     code:-1
-                                 userInfo:@{NSLocalizedDescriptionKey: @"No external DDC/CI backend is implemented yet"}];
+    LumenDDCMapping *mapping = [self mappingForDisplay:display error:error];
+    if (!mapping) {
+        return NO;
+    }
+
+    UInt16 maximum = mapping.maxBrightness > 0 ? mapping.maxBrightness : 100;
+    UInt16 value = (UInt16)lroundf(MIN(1.0f, MAX(0.0f, brightness)) * (float)maximum);
+    if (![self writeBrightness:value mapping:mapping error:error]) {
+        [self.mappingsByDisplayKey removeObjectForKey:display.stableKey];
+        return NO;
+    }
+    return YES;
+}
+
+- (NSString *)failureReasonForDisplay:(LumenDisplay *)display {
+    NSString *reason = self.failuresByDisplayKey[display.stableKey];
+    return reason.length > 0 ? reason : nil;
+}
+
+- (LumenDDCMapping *)mappingForDisplay:(LumenDisplay *)display error:(NSError **)error {
+    LumenDDCMapping *cached = self.mappingsByDisplayKey[display.stableKey];
+    if (cached) {
+        return cached;
+    }
+
+    LumenDDCMapping *mapping = LumenIsArm64() ? [self armMappingForDisplay:display error:error] : [self intelMappingForDisplay:display error:error];
+    if (mapping) {
+        self.mappingsByDisplayKey[display.stableKey] = mapping;
+        os_log_info(LumenDebugLog(),
+                    "DDC backend selected display=%{public}@ key=%{public}@ path=%{public}@",
+                    display.displayName,
+                    display.stableKey.length > 8 ? [display.stableKey substringFromIndex:display.stableKey.length - 8] : display.stableKey,
+                    mapping.arm64 ? @"IOAVService" : @"IOI2C");
+    }
+    return mapping;
+}
+
+- (LumenDDCMapping *)intelMappingForDisplay:(LumenDisplay *)display error:(NSError **)error {
+    io_service_t framebuffer = 0;
+    CGSServiceForDisplayNumber(display.displayID, &framebuffer);
+    if (!framebuffer) {
+        framebuffer = [self framebufferByDisplayPropertiesForDisplay:display];
+    }
+    if (!framebuffer) {
+        if (error) {
+            *error = LumenBrightnessError(-10, @"no DDC/CI framebuffer service found");
+        }
+        return nil;
+    }
+
+    IOItemCount busCount = 0;
+    if (IOFBGetI2CInterfaceCount(framebuffer, &busCount) != KERN_SUCCESS || busCount < 1) {
+        IOObjectRelease(framebuffer);
+        if (error) {
+            *error = LumenBrightnessError(-11, @"DDC/CI framebuffer has no I2C bus");
+        }
+        return nil;
+    }
+
+    IOOptionBits transactionType = [self supportedIntelReplyTransactionType];
+    if (transactionType == 0) {
+        IOObjectRelease(framebuffer);
+        if (error) {
+            *error = LumenBrightnessError(-12, @"backend unavailable on this hardware: no DDC reply transaction type");
+        }
+        return nil;
+    }
+
+    LumenDDCMapping *mapping = [LumenDDCMapping new];
+    mapping.arm64 = NO;
+    mapping.framebuffer = framebuffer;
+    mapping.replyTransactionType = transactionType;
+    mapping.maxBrightness = 100;
+    return mapping;
+}
+
+- (io_service_t)framebufferByDisplayPropertiesForDisplay:(LumenDisplay *)display {
+    io_iterator_t iterator = IO_OBJECT_NULL;
+    kern_return_t status = IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(IOFRAMEBUFFER_CONFORMSTO), &iterator);
+    if (status != KERN_SUCCESS) {
+        return 0;
+    }
+
+    io_service_t matched = 0;
+    io_service_t service = 0;
+    while ((service = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+        NSDictionary *dictionary = CFBridgingRelease(IODisplayCreateInfoDictionary(service, kIODisplayOnlyPreferredName));
+        NSNumber *vendor = LumenNumberFromDictionary(dictionary, kDisplayVendorID);
+        NSNumber *product = LumenNumberFromDictionary(dictionary, kDisplayProductID);
+        NSNumber *serial = LumenNumberFromDictionary(dictionary, kDisplaySerialNumber);
+        if (vendor.unsignedIntValue == CGDisplayVendorNumber(display.displayID) &&
+            product.unsignedIntValue == CGDisplayModelNumber(display.displayID) &&
+            serial.unsignedIntValue == CGDisplaySerialNumber(display.displayID)) {
+            matched = service;
+            break;
+        }
+        IOObjectRelease(service);
+    }
+    IOObjectRelease(iterator);
+    return matched;
+}
+
+- (IOOptionBits)supportedIntelReplyTransactionType {
+    io_iterator_t iterator = IO_OBJECT_NULL;
+    kern_return_t status = IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceNameMatching("IOFramebufferI2CInterface"), &iterator);
+    if (status != KERN_SUCCESS) {
+        return 0;
+    }
+
+    IOOptionBits transactionType = 0;
+    io_service_t service = 0;
+    while ((service = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+        CFMutableDictionaryRef properties = NULL;
+        if (IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0) == KERN_SUCCESS && properties) {
+            NSDictionary *dictionary = CFBridgingRelease(properties);
+            NSNumber *types = dictionary[@(kIOI2CTransactionTypesKey)];
+            uint64_t value = types.unsignedLongLongValue;
+            if ((value & (1ULL << kIOI2CDDCciReplyTransactionType)) != 0) {
+                transactionType = kIOI2CDDCciReplyTransactionType;
+            } else if ((value & (1ULL << kIOI2CSimpleTransactionType)) != 0) {
+                transactionType = kIOI2CSimpleTransactionType;
+            }
+        }
+        IOObjectRelease(service);
+        if (transactionType != 0) {
+            break;
+        }
+    }
+    IOObjectRelease(iterator);
+    return transactionType;
+}
+
+- (LumenDDCMapping *)armMappingForDisplay:(LumenDisplay *)display error:(NSError **)error {
+    NSArray<NSDictionary<NSString *, id> *> *candidates = [self armServiceCandidates];
+    NSUInteger externalDisplayCount = [self externalDisplayCount];
+    NSMutableArray<NSDictionary<NSString *, id> *> *ranked = [NSMutableArray new];
+    NSInteger bestScore = 0;
+
+    for (NSDictionary *candidate in candidates) {
+        NSInteger score = [self armCandidate:candidate scoreForDisplay:display];
+        if (score == 0 && externalDisplayCount == 1 && candidates.count == 1) {
+            score = 1;
+        }
+        if (score > 0) {
+            NSMutableDictionary *rankedCandidate = [candidate mutableCopy];
+            rankedCandidate[@"score"] = @(score);
+            [ranked addObject:rankedCandidate];
+            bestScore = MAX(bestScore, score);
+        }
+    }
+
+    NSArray *best = [ranked filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *candidate, NSDictionary *bindings) {
+        return [candidate[@"score"] integerValue] == bestScore;
+    }]];
+    if (best.count == 0) {
+        if (error) {
+            *error = LumenBrightnessError(-20, @"no DDC/CI IOAVService found");
+        }
+        return nil;
+    }
+    if (best.count > 1) {
+        if (error) {
+            *error = LumenBrightnessError(-21, @"ambiguous display mapping for DDC/CI IOAVService");
+        }
+        return nil;
+    }
+
+    LumenDDCMapping *mapping = best.firstObject[@"mapping"];
+    mapping.arm64 = YES;
+    mapping.maxBrightness = 100;
+    return mapping;
+}
+
+- (NSUInteger)externalDisplayCount {
+    uint32_t count = 0;
+    if (CGGetActiveDisplayList(0, NULL, &count) != kCGErrorSuccess || count == 0) {
+        return 0;
+    }
+    CGDirectDisplayID displayIDs[count];
+    if (CGGetActiveDisplayList(count, displayIDs, &count) != kCGErrorSuccess) {
+        return 0;
+    }
+    NSUInteger external = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!CGDisplayIsBuiltin(displayIDs[i])) {
+            external++;
+        }
+    }
+    return external;
+}
+
+- (NSArray<NSDictionary<NSString *, id> *> *)armServiceCandidates {
+    NSMutableArray<NSDictionary<NSString *, id> *> *candidates = [NSMutableArray new];
+    io_registry_entry_t root = IORegistryGetRootEntry(kIOMainPortDefault);
+    if (!root) {
+        return candidates;
+    }
+
+    io_iterator_t iterator = IO_OBJECT_NULL;
+    if (IORegistryEntryCreateIterator(root, kIOServicePlane, kIORegistryIterateRecursively, &iterator) != KERN_SUCCESS) {
+        IOObjectRelease(root);
+        return candidates;
+    }
+
+    NSMutableDictionary<NSString *, id> *currentDisplay = [NSMutableDictionary new];
+    io_service_t entry = 0;
+    NSUInteger serviceLocation = 0;
+    while ((entry = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+        io_name_t name;
+        if (IORegistryEntryGetName(entry, name) != KERN_SUCCESS) {
+            IOObjectRelease(entry);
+            continue;
+        }
+        NSString *entryName = @(name);
+        if ([entryName containsString:@"AppleCLCD2"] || [entryName containsString:@"IOMobileFramebufferShim"]) {
+            currentDisplay = [[self armDisplayPropertiesForEntry:entry] mutableCopy];
+            serviceLocation++;
+            currentDisplay[@"serviceLocation"] = @(serviceLocation);
+        } else if ([entryName containsString:@"DCPAVServiceProxy"]) {
+            NSString *location = [self stringProperty:@"Location" entry:entry recursive:YES];
+            if ([location isEqualToString:@"External"]) {
+                IOAVService service = IOAVServiceCreateWithService(kCFAllocatorDefault, entry);
+                if (service) {
+                    LumenDDCMapping *mapping = [LumenDDCMapping new];
+                    mapping.avService = service;
+                    NSMutableDictionary *candidate = currentDisplay ? [currentDisplay mutableCopy] : [NSMutableDictionary new];
+                    candidate[@"mapping"] = mapping;
+                    [candidates addObject:candidate];
+                }
+            }
+        }
+        IOObjectRelease(entry);
+    }
+
+    IOObjectRelease(iterator);
+    IOObjectRelease(root);
+    return candidates;
+}
+
+- (NSDictionary<NSString *, id> *)armDisplayPropertiesForEntry:(io_service_t)entry {
+    NSMutableDictionary *properties = [NSMutableDictionary new];
+    NSString *edidUUID = [self stringProperty:@"EDID UUID" entry:entry recursive:YES];
+    if (edidUUID.length > 0) {
+        properties[@"edidUUID"] = edidUUID;
+    }
+
+    io_string_t path;
+    if (IORegistryEntryGetPath(entry, kIOServicePlane, path) == KERN_SUCCESS) {
+        properties[@"ioDisplayLocation"] = @(path);
+    }
+
+    NSDictionary *displayAttributes = [self dictionaryProperty:@"DisplayAttributes" entry:entry recursive:YES];
+    NSDictionary *productAttributes = displayAttributes[@"ProductAttributes"];
+    if ([productAttributes isKindOfClass:[NSDictionary class]]) {
+        if ([productAttributes[@"ProductName"] isKindOfClass:[NSString class]]) {
+            properties[@"productName"] = productAttributes[@"ProductName"];
+        }
+        if ([productAttributes[@"SerialNumber"] isKindOfClass:[NSNumber class]]) {
+            properties[@"serialNumber"] = productAttributes[@"SerialNumber"];
+        }
+    }
+    return properties;
+}
+
+- (NSInteger)armCandidate:(NSDictionary<NSString *, id> *)candidate scoreForDisplay:(LumenDisplay *)display {
+    NSDictionary *displayInfo = CFBridgingRelease(CoreDisplay_DisplayCreateInfoDictionary(display.displayID));
+    NSInteger score = 0;
+    NSString *candidateLocation = candidate[@"ioDisplayLocation"];
+    NSString *displayLocation = displayInfo[@(kIODisplayLocationKey)];
+    if (candidateLocation.length > 0 && [candidateLocation isEqualToString:displayLocation]) {
+        score += 10;
+    }
+
+    NSString *candidateName = candidate[@"productName"];
+    NSDictionary *displayProductName = displayInfo[@"DisplayProductName"];
+    NSString *localizedDisplayName = [displayProductName isKindOfClass:[NSDictionary class]] ? (displayProductName[@"en_US"] ?: displayProductName.allValues.firstObject) : nil;
+    if (candidateName.length > 0 && localizedDisplayName.length > 0 &&
+        [candidateName caseInsensitiveCompare:localizedDisplayName] == NSOrderedSame) {
+        score += 1;
+    }
+
+    NSNumber *candidateSerial = candidate[@"serialNumber"];
+    NSNumber *displaySerial = LumenNumberFromDictionary(displayInfo, kDisplaySerialNumber);
+    if (candidateSerial && displaySerial && candidateSerial.longLongValue == displaySerial.longLongValue) {
+        score += 1;
+    }
+    return score;
+}
+
+- (NSString *)stringProperty:(NSString *)property entry:(io_service_t)entry recursive:(BOOL)recursive {
+    CFTypeRef value = IORegistryEntryCreateCFProperty(entry,
+                                                      (__bridge CFStringRef)property,
+                                                      kCFAllocatorDefault,
+                                                      recursive ? kIORegistryIterateRecursively : 0);
+    if (!value) {
+        return nil;
+    }
+    id object = CFBridgingRelease(value);
+    return [object isKindOfClass:[NSString class]] ? object : nil;
+}
+
+- (NSDictionary *)dictionaryProperty:(NSString *)property entry:(io_service_t)entry recursive:(BOOL)recursive {
+    CFTypeRef value = IORegistryEntryCreateCFProperty(entry,
+                                                      (__bridge CFStringRef)property,
+                                                      kCFAllocatorDefault,
+                                                      recursive ? kIORegistryIterateRecursively : 0);
+    if (!value) {
+        return nil;
+    }
+    id object = CFBridgingRelease(value);
+    return [object isKindOfClass:[NSDictionary class]] ? object : nil;
+}
+
+- (BOOL)readBrightnessCurrent:(UInt16 *)current maximum:(UInt16 *)maximum mapping:(LumenDDCMapping *)mapping error:(NSError **)error {
+    if (mapping.arm64) {
+        return [self armReadCommand:LumenDDCVCPBrightness current:current maximum:maximum mapping:mapping error:error];
+    }
+    return [self intelReadCommand:LumenDDCVCPBrightness current:current maximum:maximum mapping:mapping error:error];
+}
+
+- (BOOL)writeBrightness:(UInt16)value mapping:(LumenDDCMapping *)mapping error:(NSError **)error {
+    if (mapping.arm64) {
+        return [self armWriteCommand:LumenDDCVCPBrightness value:value mapping:mapping error:error];
+    }
+    return [self intelWriteCommand:LumenDDCVCPBrightness value:value mapping:mapping error:error];
+}
+
+- (BOOL)intelSendRequest:(IOI2CRequest *)request mapping:(LumenDDCMapping *)mapping {
+    IOItemCount busCount = 0;
+    if (IOFBGetI2CInterfaceCount(mapping.framebuffer, &busCount) != KERN_SUCCESS) {
+        return NO;
+    }
+    for (IOOptionBits bus = 0; bus < busCount; bus++) {
+        io_service_t interface = 0;
+        if (IOFBCopyI2CInterfaceForBus(mapping.framebuffer, bus, &interface) != KERN_SUCCESS) {
+            continue;
+        }
+        IOI2CConnectRef connect = NULL;
+        BOOL success = NO;
+        if (IOI2CInterfaceOpen(interface, 0, &connect) == KERN_SUCCESS) {
+            success = IOI2CSendRequest(connect, 0, request) == KERN_SUCCESS && request->result == KERN_SUCCESS;
+            IOI2CInterfaceClose(connect, 0);
+        }
+        IOObjectRelease(interface);
+        if (success) {
+            return YES;
+        }
     }
     return NO;
+}
+
+- (BOOL)intelReadCommand:(UInt8)command current:(UInt16 *)current maximum:(UInt16 *)maximum mapping:(LumenDDCMapping *)mapping error:(NSError **)error {
+    UInt8 data[5] = {LumenDDCSubAddress, 0x82, 0x01, command, 0};
+    data[4] = LumenDDCChecksum(LumenIntelDDCWriteAddress, data, 4);
+    UInt8 reply[11] = {0};
+
+    IOI2CRequest request = {0};
+    request.commFlags = 0;
+    request.sendAddress = LumenIntelDDCWriteAddress;
+    request.sendTransactionType = kIOI2CSimpleTransactionType;
+    request.sendBuffer = (vm_address_t)data;
+    request.sendBytes = sizeof(data);
+    request.minReplyDelay = 10;
+    request.replyAddress = LumenIntelDDCReadAddress;
+    request.replySubAddress = LumenDDCSubAddress;
+    request.replyTransactionType = mapping.replyTransactionType;
+    request.replyBuffer = (vm_address_t)reply;
+    request.replyBytes = sizeof(reply);
+
+    usleep(10000);
+    if (![self intelSendRequest:&request mapping:mapping]) {
+        if (error) {
+            *error = LumenBrightnessError(-30, @"DDC/CI brightness read failed");
+        }
+        return NO;
+    }
+
+    if (reply[10] != LumenDDCChecksum(0x50, reply, 10) || reply[2] != 0x02 || reply[3] != 0x00) {
+        if (error) {
+            *error = LumenBrightnessError(-31, reply[3] != 0x00 ? @"brightness command unsupported" : @"DDC/CI brightness read returned invalid data");
+        }
+        return NO;
+    }
+
+    *maximum = ((UInt16)reply[6] << 8) | reply[7];
+    *current = ((UInt16)reply[8] << 8) | reply[9];
+    if (*maximum == 0) {
+        if (error) {
+            *error = LumenBrightnessError(-32, @"DDC/CI brightness read returned zero maximum");
+        }
+        return NO;
+    }
+    return YES;
+}
+
+- (BOOL)intelWriteCommand:(UInt8)command value:(UInt16)value mapping:(LumenDDCMapping *)mapping error:(NSError **)error {
+    UInt8 data[7] = {LumenDDCSubAddress, 0x84, 0x03, command, (UInt8)(value >> 8), (UInt8)(value & 0xff), 0};
+    data[6] = LumenDDCChecksum(LumenIntelDDCWriteAddress, data, 6);
+
+    BOOL success = NO;
+    for (NSUInteger i = 0; i < 2; i++) {
+        IOI2CRequest request = {0};
+        request.commFlags = 0;
+        request.sendAddress = LumenIntelDDCWriteAddress;
+        request.sendTransactionType = kIOI2CSimpleTransactionType;
+        request.sendBuffer = (vm_address_t)data;
+        request.sendBytes = sizeof(data);
+        request.replyTransactionType = kIOI2CNoTransactionType;
+        request.replyBytes = 0;
+        usleep(10000);
+        success = [self intelSendRequest:&request mapping:mapping] || success;
+    }
+    if (!success && error) {
+        *error = LumenBrightnessError(-33, @"DDC/CI brightness write failed");
+    }
+    return success;
+}
+
+- (BOOL)armReadCommand:(UInt8)command current:(UInt16 *)current maximum:(UInt16 *)maximum mapping:(LumenDDCMapping *)mapping error:(NSError **)error {
+    UInt8 packet[5] = {0x82, 0x01, command, 0, 0};
+    packet[3] = LumenDDCChecksum(LumenArmDDC7BitAddress << 1, packet, 3);
+    UInt8 reply[11] = {0};
+
+    BOOL success = NO;
+    for (NSUInteger attempt = 0; attempt < 5 && !success; attempt++) {
+        usleep(10000);
+        IOReturn writeResult = IOAVServiceWriteI2C(mapping.avService, LumenArmDDC7BitAddress, LumenDDCSubAddress, packet, 4);
+        usleep(50000);
+        IOReturn readResult = IOAVServiceReadI2C(mapping.avService, LumenArmDDC7BitAddress, 0, reply, sizeof(reply));
+        success = writeResult == KERN_SUCCESS && readResult == KERN_SUCCESS && reply[10] == LumenDDCChecksum(0x50, reply, 10);
+        if (!success) {
+            usleep(20000);
+        }
+    }
+    if (!success || reply[2] != 0x02 || reply[3] != 0x00) {
+        if (error) {
+            *error = LumenBrightnessError(-40, reply[3] != 0x00 ? @"brightness command unsupported" : @"DDC/CI brightness read failed");
+        }
+        return NO;
+    }
+
+    *maximum = ((UInt16)reply[6] << 8) | reply[7];
+    *current = ((UInt16)reply[8] << 8) | reply[9];
+    if (*maximum == 0) {
+        if (error) {
+            *error = LumenBrightnessError(-41, @"DDC/CI brightness read returned zero maximum");
+        }
+        return NO;
+    }
+    return YES;
+}
+
+- (BOOL)armWriteCommand:(UInt8)command value:(UInt16)value mapping:(LumenDDCMapping *)mapping error:(NSError **)error {
+    UInt8 packet[6] = {0x84, 0x03, command, (UInt8)(value >> 8), (UInt8)(value & 0xff), 0};
+    packet[5] = LumenDDCChecksum((LumenArmDDC7BitAddress << 1) ^ LumenDDCSubAddress, packet, 5);
+
+    BOOL success = NO;
+    for (NSUInteger attempt = 0; attempt < 5 && !success; attempt++) {
+        for (NSUInteger cycle = 0; cycle < 2; cycle++) {
+            usleep(10000);
+            success = IOAVServiceWriteI2C(mapping.avService, LumenArmDDC7BitAddress, LumenDDCSubAddress, packet, sizeof(packet)) == KERN_SUCCESS || success;
+        }
+        if (!success) {
+            usleep(20000);
+        }
+    }
+    if (!success && error) {
+        *error = LumenBrightnessError(-42, @"DDC/CI brightness write failed");
+    }
+    return success;
 }
 
 @end
@@ -318,13 +902,16 @@ static void LumenDisplayReconfigurationCallback(CGDirectDisplayID display,
                             display:display];
             }
         } else {
-            [self setAction:@"skipped: unsupported" reason:@"skipped unsupported display" display:display state:state];
-            [self addDebugEvent:@"brightness unsupported" display:display];
+            NSString *failureReason = [self brightnessFailureReasonForDisplay:display] ?: @"unsupported brightness backend";
+            state.lastReadError = failureReason;
+            [self setAction:@"skipped: unsupported brightness backend" reason:@"unsupported brightness backend" display:display state:state];
+            [self addDebugEvent:[NSString stringWithFormat:@"brightness unsupported: %@", failureReason] display:display];
             os_log_info(LumenDebugLog(),
-                        "Brightness unsupported display=%{public}@ key=%{public}@ id=%{public}u",
+                        "Brightness unsupported display=%{public}@ key=%{public}@ id=%{public}u reason=%{public}@",
                         display.displayName,
                         [self shortDisplayKey:display.stableKey],
-                        display.displayID);
+                        display.displayID,
+                        failureReason);
         }
 
         states[display.stableKey] = state;
@@ -533,20 +1120,35 @@ static void LumenDisplayReconfigurationCallback(CGDirectDisplayID display,
         return;
     }
 
+    NSTimeInterval currentTime = [NSDate timeIntervalSinceReferenceDate];
+    float brightness = [self.model predictFromInput:lightness displayKey:display.stableKey];
+    state.latestTargetBrightness = brightness;
+    state.latestTargetTime = currentTime;
+
     if (!display.brightnessControllable) {
-        [self setAction:@"skipped: unsupported" reason:@"skipped unsupported display" display:display state:state];
-        state.lastTrainingDecision = @"not trained: unsupported display";
+        [self setAction:@"skipped: unsupported brightness backend" reason:@"unsupported brightness backend" display:display state:state];
+        state.lastTrainingDecision = @"not trained: unsupported brightness backend";
+        [self addSkippedDecisionEventForDisplay:display
+                                          state:state
+                                      lightness:lightness
+                                         target:brightness
+                              currentBrightness:state.latestBrightness
+                                         reason:@"unsupported brightness backend"];
         return;
     }
-
-    NSTimeInterval currentTime = [NSDate timeIntervalSinceReferenceDate];
 
     NSError *brightnessError = nil;
     float setPoint = [self brightnessForDisplay:display error:&brightnessError];
     if (brightnessError) {
         state.canReadBrightness = NO;
         state.lastReadError = brightnessError.localizedDescription ?: @"brightness read failed";
-        [self setAction:@"skipped: unreadable" reason:@"skipped brightness unreadable" display:display state:state];
+        [self setAction:@"skipped: unreadable brightness" reason:@"unreadable brightness" display:display state:state];
+        [self addSkippedDecisionEventForDisplay:display
+                                          state:state
+                                      lightness:lightness
+                                         target:brightness
+                              currentBrightness:state.latestBrightness
+                                         reason:@"unreadable brightness"];
         [self addDebugEvent:[NSString stringWithFormat:@"brightness read failed: %@", state.lastReadError] display:display];
         os_log_error(LumenDebugLog(),
                      "Brightness read failed display=%{public}@ key=%{public}@ error=%{public}@",
@@ -571,7 +1173,13 @@ static void LumenDisplayReconfigurationCallback(CGDirectDisplayID display,
             state.lastNoticed = setPoint;
             state.lastManualChangeTime = currentTime;
             state.lastTrainingDecision = @"pending: manual override debounce";
-            [self setAction:@"skipped: debounce" reason:@"skipped manual override debounce" display:display state:state];
+            [self setAction:@"skipped: debounce" reason:@"debounce" display:display state:state];
+            [self addSkippedDecisionEventForDisplay:display
+                                              state:state
+                                          lightness:lightness
+                                             target:brightness
+                                  currentBrightness:setPoint
+                                             reason:@"debounce"];
             [self addDebugEvent:[NSString stringWithFormat:@"manual override detected %.3f -> %.3f",
                                  state.lastManualOverrideOldBrightness,
                                  setPoint]
@@ -584,11 +1192,23 @@ static void LumenDisplayReconfigurationCallback(CGDirectDisplayID display,
             state.lastNoticed = setPoint;
             state.lastManualChangeTime = currentTime;
             state.lastTrainingDecision = @"pending: manual override changing";
-            [self setAction:@"skipped: debounce" reason:@"skipped manual override debounce" display:display state:state];
+            [self setAction:@"skipped: debounce" reason:@"debounce" display:display state:state];
+            [self addSkippedDecisionEventForDisplay:display
+                                              state:state
+                                          lightness:lightness
+                                             target:brightness
+                                  currentBrightness:setPoint
+                                             reason:@"debounce"];
             return;
         } else if (currentTime - state.lastManualChangeTime < DEBOUNCE_DELAY) {
             state.lastTrainingDecision = @"pending: manual override debounce";
-            [self setAction:@"skipped: debounce" reason:@"skipped manual override debounce" display:display state:state];
+            [self setAction:@"skipped: debounce" reason:@"debounce" display:display state:state];
+            [self addSkippedDecisionEventForDisplay:display
+                                              state:state
+                                          lightness:lightness
+                                             target:brightness
+                                  currentBrightness:setPoint
+                                             reason:@"debounce"];
             return;
         } else if (state.shouldIgnoreOutput) {
             state.shouldIgnoreOutput = NO;
@@ -618,17 +1238,25 @@ static void LumenDisplayReconfigurationCallback(CGDirectDisplayID display,
         state.lastTrainingDecision = @"not trained: no manual override";
     }
 
-    float brightness = [self.model predictFromInput:lightness displayKey:display.stableKey];
-    state.latestTargetBrightness = brightness;
-    state.latestTargetTime = currentTime;
-
     if (currentTime - state.lastAutoBrightnessTime < DEBOUNCE_DELAY) {
-        [self setAction:@"skipped: debounce" reason:@"skipped automatic debounce" display:display state:state];
+        [self setAction:@"skipped: debounce" reason:@"debounce" display:display state:state];
+        [self addSkippedDecisionEventForDisplay:display
+                                          state:state
+                                      lightness:lightness
+                                         target:brightness
+                              currentBrightness:setPoint
+                                         reason:@"debounce"];
         return;
     }
 
     if (brightness == state.lastAssigned) {
         [self setAction:@"unchanged" reason:@"unchanged within tolerance" display:display state:state];
+        [self addSkippedDecisionEventForDisplay:display
+                                          state:state
+                                      lightness:lightness
+                                         target:brightness
+                              currentBrightness:setPoint
+                                         reason:@"unchanged"];
         return;
     }
 
@@ -651,7 +1279,13 @@ static void LumenDisplayReconfigurationCallback(CGDirectDisplayID display,
     } else {
         state.canSetBrightness = NO;
         state.lastWriteError = setError.localizedDescription ?: @"brightness write failed";
-        [self setAction:@"skipped: write failed" reason:@"skipped brightness write failed" display:display state:state];
+        [self setAction:@"skipped: write failed" reason:@"write failed" display:display state:state];
+        [self addSkippedDecisionEventForDisplay:display
+                                          state:state
+                                      lightness:lightness
+                                         target:brightness
+                              currentBrightness:setPoint
+                                         reason:@"write failed"];
         [self addDebugEvent:[NSString stringWithFormat:@"brightness write failed: %@", state.lastWriteError] display:display];
         os_log_error(LumenDebugLog(),
                      "Brightness write failed display=%{public}@ key=%{public}@ target=%{public}.3f error=%{public}@",
@@ -841,6 +1475,50 @@ static void LumenDisplayReconfigurationCallback(CGDirectDisplayID display,
     }
 }
 
+- (void)addSkippedDecisionEventForDisplay:(LumenDisplay *)display
+                                    state:(LumenDisplayState *)state
+                                lightness:(double)lightness
+                                   target:(float)target
+                        currentBrightness:(float)currentBrightness
+                                   reason:(NSString *)reason {
+    NSString *event = [NSString stringWithFormat:@"decision skipped: %@ lightness %.3f target %.3f%@",
+                       reason ?: @"unknown",
+                       lightness / 100.0,
+                       target,
+                       currentBrightness >= 0 ? [NSString stringWithFormat:@" current %.3f", currentBrightness] : @""];
+    NSMutableDictionary *entry = [@{@"timestamp": @([NSDate timeIntervalSinceReferenceDate]),
+                                    @"time": [self formattedTime:[NSDate timeIntervalSinceReferenceDate]],
+                                    @"event": event,
+                                    @"action": @"skipped",
+                                    @"reason": reason ?: @"unknown",
+                                    @"role": [self roleForDisplay:display],
+                                    @"lightness": @(lightness / 100.0),
+                                    @"lightnessLStar": @(lightness),
+                                    @"targetBrightness": @(target)} mutableCopy];
+    if (currentBrightness >= 0) {
+        entry[@"currentBrightness"] = @(currentBrightness);
+    }
+    if (display) {
+        entry[@"display"] = display.displayName ?: @"";
+        entry[@"key"] = display.stableKey ?: @"";
+        entry[@"debugKey"] = [self shortDisplayKey:display.stableKey];
+        entry[@"displayID"] = @(display.displayID);
+    }
+    [self.debugEvents addObject:entry];
+    while (self.debugEvents.count > LumenMaxDebugEvents) {
+        [self.debugEvents removeObjectAtIndex:0];
+    }
+
+    os_log_debug(LumenDebugLog(),
+                 "Decision skipped display=%{public}@ role=%{public}@ lightness=%{public}.3f target=%{public}.3f current=%{public}.3f reason=%{public}@",
+                 display.displayName,
+                 [self roleForDisplay:display],
+                 lightness / 100.0,
+                 target,
+                 currentBrightness,
+                 reason ?: @"unknown");
+}
+
 - (void)setAction:(NSString *)action reason:(NSString *)reason display:(LumenDisplay *)display state:(LumenDisplayState *)state {
     if (!state) {
         return;
@@ -885,9 +1563,29 @@ static void LumenDisplayReconfigurationCallback(CGDirectDisplayID display,
 }
 
 - (id<LumenBrightnessBackend>)backendForDisplay:(LumenDisplay *)display {
+    if (display.brightnessControllable && display.brightnessBackendName.length > 0) {
+        for (id<LumenBrightnessBackend> backend in self.brightnessBackends) {
+            if ([backend.name isEqualToString:display.brightnessBackendName]) {
+                return backend;
+            }
+        }
+    }
+
     for (id<LumenBrightnessBackend> backend in self.brightnessBackends) {
         if ([backend canControlDisplay:display]) {
             return backend;
+        }
+    }
+    return nil;
+}
+
+- (NSString *)brightnessFailureReasonForDisplay:(LumenDisplay *)display {
+    for (id<LumenBrightnessBackend> backend in self.brightnessBackends) {
+        if ([backend respondsToSelector:@selector(failureReasonForDisplay:)]) {
+            NSString *reason = [backend failureReasonForDisplay:display];
+            if (reason.length > 0) {
+                return reason;
+            }
         }
     }
     return nil;
