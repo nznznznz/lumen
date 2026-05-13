@@ -20,5 +20,7 @@
 - (NSArray<NSDictionary<NSString *, id> *> *)displayDebugStatuses;
 - (NSDictionary<NSString *, id> *)debugSnapshot;
 - (NSString *)debugSnapshotText;
+- (void)recordDebugPanelRenderDuration:(NSTimeInterval)duration;
+- (void)resetLearnedCalibrationForDebug;
 
 @end

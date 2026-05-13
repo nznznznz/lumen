@@ -26,6 +26,12 @@ extern void CGSServiceForDisplayNumber(CGDirectDisplayID display, io_service_t *
 
 static NSString * const LumenBrightnessErrorDomain = @"com.anishathalye.lumen.brightness";
 static NSUInteger const LumenMaxDebugEvents = 50;
+static NSTimeInterval const LumenOwnWriteReadbackDebounce = 2.0;
+static NSTimeInterval const LumenNoisyDebugEventInterval = 5.0;
+static NSTimeInterval const LumenDDCMinimumCommandInterval = 0.35;
+static NSTimeInterval const LumenDDCSlowCommandThreshold = 1.5;
+static NSTimeInterval const LumenDDCDegradedCooldown = 5.0;
+static float const LumenDDCSafeMinimumBrightness = 0.05f;
 
 static os_log_t LumenDebugLog(void) {
     static os_log_t log;
@@ -45,7 +51,11 @@ static os_log_t LumenDebugLog(void) {
 - (BOOL)setBrightness:(float)brightness forDisplay:(LumenDisplay *)display error:(NSError **)error;
 
 @optional
+- (BOOL)canSetDisplay:(LumenDisplay *)display;
+- (BOOL)canReadDisplay:(LumenDisplay *)display;
 - (NSString *)failureReasonForDisplay:(LumenDisplay *)display;
+- (NSDictionary<NSString *, id> *)debugInfoForDisplay:(LumenDisplay *)display;
+- (BOOL)shouldReadBackAfterWrite;
 
 @end
 
@@ -58,6 +68,12 @@ static os_log_t LumenDebugLog(void) {
 
 @property (nonatomic, strong) NSMutableDictionary<NSString *, LumenDDCMapping *> *mappingsByDisplayKey;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *failuresByDisplayKey;
+@property (nonatomic, strong) dispatch_queue_t ddcQueue;
+@property (nonatomic, copy) void (^debugUpdateHandler)(void);
+
+- (BOOL)reserveDDCCommand:(NSString *)command mapping:(LumenDDCMapping *)mapping error:(NSError **)error;
+- (void)finishDDCCommand:(NSString *)command mapping:(LumenDDCMapping *)mapping success:(BOOL)success error:(NSError *)commandError startedAt:(NSTimeInterval)startedAt;
+- (void)notifyDebugStateChanged;
 
 @end
 
@@ -69,12 +85,36 @@ static os_log_t LumenDebugLog(void) {
 @property (nonatomic, assign) IOOptionBits replyTransactionType;
 @property (nonatomic, assign) UInt16 maxBrightness;
 @property (nonatomic, copy) NSString *failureReason;
+@property (nonatomic, copy) NSString *backendState;
+@property (nonatomic, assign) NSTimeInterval lastCommandTime;
+@property (nonatomic, assign) BOOL commandInFlight;
+@property (nonatomic, assign) BOOL rateLimited;
+@property (nonatomic, assign) NSUInteger skippedInFlightCount;
+@property (nonatomic, assign) NSUInteger skippedRateLimitCount;
+@property (nonatomic, assign) NSTimeInterval degradedUntil;
+@property (nonatomic, copy) NSString *degradedReason;
+@property (nonatomic, assign) NSTimeInterval lastReadAttemptTimestamp;
+@property (nonatomic, assign) NSTimeInterval lastReadSuccessTimestamp;
+@property (nonatomic, assign) NSTimeInterval lastReadDuration;
+@property (nonatomic, copy) NSString *lastReadError;
+@property (nonatomic, assign) NSUInteger consecutiveReadFailures;
+@property (nonatomic, assign) NSTimeInterval lastWriteAttemptTimestamp;
+@property (nonatomic, assign) NSTimeInterval lastWriteSuccessTimestamp;
+@property (nonatomic, assign) NSTimeInterval lastWriteDuration;
+@property (nonatomic, copy) NSString *lastWriteError;
+@property (nonatomic, assign) NSUInteger consecutiveWriteFailures;
+@property (nonatomic, assign) float lastRequestedBrightness;
+@property (nonatomic, assign) float lastAppliedBrightness;
+@property (nonatomic, assign) BOOL clampApplied;
 
 @end
 
 @interface LumenDisplayState : NSObject
 
 @property (nonatomic, assign) float lastSet;
+@property (nonatomic, assign) BOOL hasValidBrightnessBaseline;
+@property (nonatomic, assign) float brightnessBaseline;
+@property (nonatomic, assign) NSTimeInterval brightnessBaselineTime;
 @property (nonatomic, assign) float lastAssigned;
 @property (nonatomic, assign) BOOL noticed;
 @property (nonatomic, assign) float lastNoticed;
@@ -98,6 +138,7 @@ static os_log_t LumenDebugLog(void) {
 @property (nonatomic, copy) NSString *lastReadError;
 @property (nonatomic, copy) NSString *lastAction;
 @property (nonatomic, copy) NSString *lastActionReason;
+@property (nonatomic, assign) NSTimeInterval lastDecisionTime;
 @property (nonatomic, copy) NSString *lastLearnEvent;
 @property (nonatomic, assign) NSTimeInterval lastLearnTime;
 @property (nonatomic, assign) float lastManualOverrideOldBrightness;
@@ -105,6 +146,9 @@ static os_log_t LumenDebugLog(void) {
 @property (nonatomic, assign) float lastManualOverrideDelta;
 @property (nonatomic, copy) NSString *lastTrainingDecision;
 @property (nonatomic, assign) BOOL seededFromLegacyModel;
+@property (nonatomic, assign) NSTimeInterval lastBaselineEventTime;
+@property (nonatomic, assign) NSTimeInterval lastIgnoredManualEventTime;
+@property (nonatomic, assign) NSUInteger droppedSampleCount;
 
 @end
 
@@ -114,6 +158,9 @@ static os_log_t LumenDebugLog(void) {
     self = [super init];
     if (self) {
         self.lastSet = -1; // force initial observation, preserving old single-display behavior
+        self.hasValidBrightnessBaseline = NO;
+        self.brightnessBaseline = -1;
+        self.brightnessBaselineTime = 0;
         self.lastAssigned = -1;
         self.noticed = NO;
         self.lastNoticed = 0;
@@ -137,6 +184,7 @@ static os_log_t LumenDebugLog(void) {
         self.lastReadError = @"";
         self.lastAction = @"waiting";
         self.lastActionReason = @"waiting for capture";
+        self.lastDecisionTime = 0;
         self.lastLearnEvent = @"none";
         self.lastLearnTime = 0;
         self.lastManualOverrideOldBrightness = -1;
@@ -144,6 +192,9 @@ static os_log_t LumenDebugLog(void) {
         self.lastManualOverrideDelta = 0;
         self.lastTrainingDecision = @"none";
         self.seededFromLegacyModel = NO;
+        self.lastBaselineEventTime = 0;
+        self.lastIgnoredManualEventTime = 0;
+        self.droppedSampleCount = 0;
     }
     return self;
 }
@@ -173,10 +224,20 @@ static os_log_t LumenDebugLog(void) {
  Maintains the last frontmost application (other than Lumen).
  */
 @property (nonatomic, strong) NSString *lastActiveAppURLString;
+@property (nonatomic, strong) dispatch_queue_t controllerQueue;
+@property (nonatomic, strong) dispatch_queue_t sampleQueue;
+@property (nonatomic, strong) dispatch_queue_t snapshotQueue;
+@property (nonatomic, strong) NSMutableSet<NSString *> *processingSampleDisplayKeys;
+@property (nonatomic, strong) NSDictionary<NSString *, id> *latestDebugSnapshot;
+@property (nonatomic, assign) NSUInteger debugSnapshotVersion;
+@property (nonatomic, assign) NSTimeInterval lastControlLoopDuration;
+@property (nonatomic, assign) NSTimeInterval snapshotGenerationDuration;
+@property (nonatomic, assign) NSTimeInterval debugPanelLastRenderDuration;
 
 - (void)reloadDisplaysAndStreams;
 - (void)stopCaptureStreams;
 - (void)processLightness:(double)lightness forDisplay:(LumenDisplay *)display;
+- (void)updateDebugSnapshot;
 - (double)computeLightnessFromSampleBuffer:(CMSampleBufferRef)sampleBuffer;
 - (void)addDebugEvent:(NSString *)event display:(LumenDisplay *)display;
 - (void)addSkippedDecisionEventForDisplay:(LumenDisplay *)display
@@ -185,6 +246,9 @@ static os_log_t LumenDebugLog(void) {
                                    target:(float)target
                         currentBrightness:(float)currentBrightness
                                    reason:(NSString *)reason;
+- (void)initialiseBrightnessBaseline:(float)brightness display:(LumenDisplay *)display state:(LumenDisplayState *)state time:(NSTimeInterval)time;
+- (void)markManualOverrideIgnored:(NSString *)decision display:(LumenDisplay *)display state:(LumenDisplayState *)state time:(NSTimeInterval)time;
+- (BOOL)isOwnWriteReadback:(float)brightness state:(LumenDisplayState *)state time:(NSTimeInterval)time;
 - (void)setAction:(NSString *)action reason:(NSString *)reason display:(LumenDisplay *)display state:(LumenDisplayState *)state;
 - (NSDictionary<NSString *, id> *)debugDictionaryForDisplay:(LumenDisplay *)display;
 - (NSString *)brightnessFailureReasonForDisplay:(LumenDisplay *)display;
@@ -198,13 +262,43 @@ static void LumenDisplayReconfigurationCallback(CGDirectDisplayID display,
                                                 CGDisplayChangeSummaryFlags flags,
                                                 void *userInfo) {
     BrightnessController *controller = (__bridge BrightnessController *)userInfo;
-    dispatch_async(dispatch_get_main_queue(), ^{
+    dispatch_async(controller.controllerQueue, ^{
         os_log_info(LumenDebugLog(), "Display reconfiguration display=%{public}u flags=%{public}u", display, flags);
         [controller reloadDisplaysAndStreams];
     });
 }
 
 @implementation LumenDDCMapping
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        self.maxBrightness = 100;
+        self.failureReason = @"";
+        self.backendState = @"DDC-CI set-only";
+        self.lastCommandTime = 0;
+        self.commandInFlight = NO;
+        self.rateLimited = NO;
+        self.skippedInFlightCount = 0;
+        self.skippedRateLimitCount = 0;
+        self.degradedUntil = 0;
+        self.degradedReason = @"";
+        self.lastReadAttemptTimestamp = 0;
+        self.lastReadSuccessTimestamp = 0;
+        self.lastReadDuration = 0;
+        self.lastReadError = @"";
+        self.consecutiveReadFailures = 0;
+        self.lastWriteAttemptTimestamp = 0;
+        self.lastWriteSuccessTimestamp = 0;
+        self.lastWriteDuration = 0;
+        self.lastWriteError = @"";
+        self.consecutiveWriteFailures = 0;
+        self.lastRequestedBrightness = -1;
+        self.lastAppliedBrightness = -1;
+        self.clampApplied = NO;
+    }
+    return self;
+}
 
 - (void)dealloc {
     if (_avService) {
@@ -301,6 +395,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     if (self) {
         self.mappingsByDisplayKey = [NSMutableDictionary new];
         self.failuresByDisplayKey = [NSMutableDictionary new];
+        self.ddcQueue = dispatch_queue_create("com.anishathalye.lumen.ddc", DISPATCH_QUEUE_SERIAL);
     }
     return self;
 }
@@ -310,6 +405,10 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
 }
 
 - (BOOL)canControlDisplay:(LumenDisplay *)display {
+    return [self canSetDisplay:display];
+}
+
+- (BOOL)canSetDisplay:(LumenDisplay *)display {
     if (display.builtin) {
         return NO;
     }
@@ -317,38 +416,38 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     NSError *error = nil;
     LumenDDCMapping *mapping = [self mappingForDisplay:display error:&error];
     if (!mapping) {
-        self.failuresByDisplayKey[display.stableKey] = error.localizedDescription ?: @"no DDC/CI service found";
+        @synchronized (self) {
+            self.failuresByDisplayKey[display.stableKey] = error.localizedDescription ?: @"no DDC/CI service found";
+        }
         return NO;
     }
 
-    UInt16 current = 0;
-    UInt16 maximum = 0;
-    if (![self readBrightnessCurrent:&current maximum:&maximum mapping:mapping error:&error]) {
-        self.failuresByDisplayKey[display.stableKey] = error.localizedDescription ?: @"brightness command unsupported";
-        [self.mappingsByDisplayKey removeObjectForKey:display.stableKey];
-        return NO;
+    @synchronized (self) {
+        self.failuresByDisplayKey[display.stableKey] = @"";
     }
-
-    mapping.maxBrightness = maximum > 0 ? maximum : 100;
-    self.failuresByDisplayKey[display.stableKey] = @"";
     return YES;
+}
+
+- (BOOL)canReadDisplay:(LumenDisplay *)display {
+    LumenDDCMapping *mapping = nil;
+    @synchronized (self) {
+        mapping = self.mappingsByDisplayKey[display.stableKey];
+    }
+    @synchronized (mapping) {
+        return mapping && mapping.lastReadSuccessTimestamp > 0;
+    }
 }
 
 - (float)brightnessForDisplay:(LumenDisplay *)display error:(NSError **)error {
     LumenDDCMapping *mapping = [self mappingForDisplay:display error:error];
     if (!mapping) {
-        return 0;
+        return NAN;
     }
 
-    UInt16 current = 0;
-    UInt16 maximum = 0;
-    if (![self readBrightnessCurrent:&current maximum:&maximum mapping:mapping error:error]) {
-        [self.mappingsByDisplayKey removeObjectForKey:display.stableKey];
-        return 0;
+    if (error) {
+        *error = LumenBrightnessError(-30, @"DDC/CI brightness read unavailable without blocking");
     }
-
-    mapping.maxBrightness = maximum > 0 ? maximum : 100;
-    return MIN(1.0f, MAX(0.0f, (float)current / (float)mapping.maxBrightness));
+    return NAN;
 }
 
 - (BOOL)setBrightness:(float)brightness forDisplay:(LumenDisplay *)display error:(NSError **)error {
@@ -357,29 +456,97 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         return NO;
     }
 
-    UInt16 maximum = mapping.maxBrightness > 0 ? mapping.maxBrightness : 100;
-    UInt16 value = (UInt16)lroundf(MIN(1.0f, MAX(0.0f, brightness)) * (float)maximum);
+    float appliedBrightness = MIN(1.0f, MAX(LumenDDCSafeMinimumBrightness, brightness));
+    UInt16 maximum = 100;
+    @synchronized (mapping) {
+        mapping.lastRequestedBrightness = brightness;
+        mapping.clampApplied = fabsf(appliedBrightness - brightness) > FLT_EPSILON;
+        maximum = mapping.maxBrightness > 0 ? mapping.maxBrightness : 100;
+    }
+    UInt16 value = (UInt16)lroundf(appliedBrightness * (float)maximum);
     if (![self writeBrightness:value mapping:mapping error:error]) {
-        [self.mappingsByDisplayKey removeObjectForKey:display.stableKey];
         return NO;
+    }
+    @synchronized (mapping) {
+        mapping.lastAppliedBrightness = appliedBrightness;
     }
     return YES;
 }
 
 - (NSString *)failureReasonForDisplay:(LumenDisplay *)display {
-    NSString *reason = self.failuresByDisplayKey[display.stableKey];
+    NSString *reason = nil;
+    @synchronized (self) {
+        reason = self.failuresByDisplayKey[display.stableKey];
+    }
     return reason.length > 0 ? reason : nil;
 }
 
+- (BOOL)shouldReadBackAfterWrite {
+    return NO;
+}
+
+- (NSDictionary<NSString *, id> *)debugInfoForDisplay:(LumenDisplay *)display {
+    LumenDDCMapping *mapping = nil;
+    NSString *failure = nil;
+    @synchronized (self) {
+        mapping = self.mappingsByDisplayKey[display.stableKey];
+        failure = self.failuresByDisplayKey[display.stableKey] ?: @"";
+    }
+    if (!mapping) {
+        return @{@"backendState": failure.length > 0 ? [NSString stringWithFormat:@"unsupported: %@", failure] : @"unsupported",
+                 @"ddcCanReadBrightness": @NO,
+                 @"ddcCanSetBrightness": @NO,
+                 @"ddcCommandInFlight": @NO,
+                 @"ddcRateLimited": @NO,
+                 @"ddcSkippedInFlightCount": @0,
+                 @"ddcSkippedRateLimitCount": @0,
+                 @"ddcLastReadDuration": @0,
+                 @"ddcLastWriteDuration": @0,
+                 @"ddcConsecutiveReadFailures": @0,
+                 @"ddcConsecutiveWriteFailures": @0,
+                 @"ddcLastReadError": failure,
+                 @"ddcLastWriteError": @""};
+    }
+
+    @synchronized (mapping) {
+        return @{@"backendState": mapping.backendState ?: @"DDC-CI",
+                 @"ddcCanReadBrightness": @(mapping.lastReadSuccessTimestamp > 0),
+                 @"ddcCanSetBrightness": @YES,
+                 @"ddcLastReadAttemptTimestamp": @(mapping.lastReadAttemptTimestamp),
+                 @"ddcLastReadSuccessTimestamp": @(mapping.lastReadSuccessTimestamp),
+                 @"ddcLastReadDuration": @(mapping.lastReadDuration),
+                 @"ddcLastReadError": mapping.lastReadError ?: @"",
+                 @"ddcLastWriteAttemptTimestamp": @(mapping.lastWriteAttemptTimestamp),
+                 @"ddcLastWriteSuccessTimestamp": @(mapping.lastWriteSuccessTimestamp),
+                 @"ddcLastWriteDuration": @(mapping.lastWriteDuration),
+                 @"ddcLastWriteError": mapping.lastWriteError ?: @"",
+                 @"ddcConsecutiveReadFailures": @(mapping.consecutiveReadFailures),
+                 @"ddcConsecutiveWriteFailures": @(mapping.consecutiveWriteFailures),
+                 @"ddcCommandInFlight": @(mapping.commandInFlight),
+                 @"ddcRateLimited": @(mapping.rateLimited),
+                 @"ddcSkippedInFlightCount": @(mapping.skippedInFlightCount),
+                 @"ddcSkippedRateLimitCount": @(mapping.skippedRateLimitCount),
+                 @"ddcDegradedUntil": @(mapping.degradedUntil),
+                 @"ddcDegradedReason": mapping.degradedReason ?: @"",
+                 @"ddcLastRequestedBrightness": @(mapping.lastRequestedBrightness),
+                 @"ddcLastAppliedBrightness": @(mapping.lastAppliedBrightness),
+                 @"ddcClampApplied": @(mapping.clampApplied)};
+    }
+}
+
 - (LumenDDCMapping *)mappingForDisplay:(LumenDisplay *)display error:(NSError **)error {
-    LumenDDCMapping *cached = self.mappingsByDisplayKey[display.stableKey];
-    if (cached) {
-        return cached;
+    @synchronized (self) {
+        LumenDDCMapping *cached = self.mappingsByDisplayKey[display.stableKey];
+        if (cached) {
+            return cached;
+        }
     }
 
     LumenDDCMapping *mapping = LumenIsArm64() ? [self armMappingForDisplay:display error:error] : [self intelMappingForDisplay:display error:error];
     if (mapping) {
-        self.mappingsByDisplayKey[display.stableKey] = mapping;
+        @synchronized (self) {
+            self.mappingsByDisplayKey[display.stableKey] = mapping;
+        }
         os_log_info(LumenDebugLog(),
                     "DDC backend selected display=%{public}@ key=%{public}@ path=%{public}@",
                     display.displayName,
@@ -666,17 +833,154 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
 }
 
 - (BOOL)readBrightnessCurrent:(UInt16 *)current maximum:(UInt16 *)maximum mapping:(LumenDDCMapping *)mapping error:(NSError **)error {
-    if (mapping.arm64) {
-        return [self armReadCommand:LumenDDCVCPBrightness current:current maximum:maximum mapping:mapping error:error];
+    if (![self reserveDDCCommand:@"read" mapping:mapping error:error]) {
+        [self notifyDebugStateChanged];
+        return NO;
     }
-    return [self intelReadCommand:LumenDDCVCPBrightness current:current maximum:maximum mapping:mapping error:error];
+
+    dispatch_async(self.ddcQueue, ^{
+        NSTimeInterval startedAt = [NSDate timeIntervalSinceReferenceDate];
+        os_log_debug(LumenDebugLog(), "DDC read start");
+        UInt16 readCurrent = 0;
+        UInt16 readMaximum = 0;
+        NSError *readError = nil;
+        BOOL success = mapping.arm64 ? [self armReadCommand:LumenDDCVCPBrightness current:&readCurrent maximum:&readMaximum mapping:mapping error:&readError] : [self intelReadCommand:LumenDDCVCPBrightness current:&readCurrent maximum:&readMaximum mapping:mapping error:&readError];
+        @synchronized (mapping) {
+            if (success) {
+                mapping.maxBrightness = readMaximum > 0 ? readMaximum : 100;
+                mapping.lastAppliedBrightness = MIN(1.0f, MAX(0.0f, (float)readCurrent / (float)mapping.maxBrightness));
+            }
+        }
+        [self finishDDCCommand:@"read" mapping:mapping success:success error:readError startedAt:startedAt];
+    });
+    return YES;
 }
 
 - (BOOL)writeBrightness:(UInt16)value mapping:(LumenDDCMapping *)mapping error:(NSError **)error {
-    if (mapping.arm64) {
-        return [self armWriteCommand:LumenDDCVCPBrightness value:value mapping:mapping error:error];
+    if (![self reserveDDCCommand:@"write" mapping:mapping error:error]) {
+        [self notifyDebugStateChanged];
+        return NO;
     }
-    return [self intelWriteCommand:LumenDDCVCPBrightness value:value mapping:mapping error:error];
+
+    dispatch_async(self.ddcQueue, ^{
+        NSTimeInterval startedAt = [NSDate timeIntervalSinceReferenceDate];
+        os_log_debug(LumenDebugLog(), "DDC write start");
+        NSError *writeError = nil;
+        BOOL success = mapping.arm64 ? [self armWriteCommand:LumenDDCVCPBrightness value:value mapping:mapping error:&writeError] : [self intelWriteCommand:LumenDDCVCPBrightness value:value mapping:mapping error:&writeError];
+        [self finishDDCCommand:@"write" mapping:mapping success:success error:writeError startedAt:startedAt];
+    });
+    return YES;
+}
+
+- (BOOL)reserveDDCCommand:(NSString *)command mapping:(LumenDDCMapping *)mapping error:(NSError **)error {
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    @synchronized (mapping) {
+        if ([command isEqualToString:@"write"] && mapping.degradedUntil > now) {
+            mapping.lastWriteError = mapping.degradedReason.length > 0 ? mapping.degradedReason : @"DDC-CI backend degraded";
+            mapping.backendState = @"DDC-CI degraded";
+            if (error) {
+                *error = LumenBrightnessError(-34, mapping.lastWriteError);
+            }
+            return NO;
+        }
+
+        if (mapping.commandInFlight) {
+            mapping.skippedInFlightCount++;
+            NSString *message = @"skipped: DDC command in flight";
+            if ([command isEqualToString:@"read"]) {
+                mapping.lastReadError = message;
+            } else {
+                mapping.lastWriteError = message;
+            }
+            mapping.backendState = message;
+            if (error) {
+                *error = LumenBrightnessError(-35, message);
+            }
+            return NO;
+        }
+
+        NSTimeInterval elapsed = now - mapping.lastCommandTime;
+        mapping.rateLimited = elapsed > 0 && elapsed < LumenDDCMinimumCommandInterval;
+        if (mapping.rateLimited) {
+            mapping.skippedRateLimitCount++;
+            NSString *message = @"skipped: DDC command rate limited";
+            if ([command isEqualToString:@"read"]) {
+                mapping.lastReadError = message;
+            } else {
+                mapping.lastWriteError = message;
+            }
+            mapping.backendState = message;
+            if (error) {
+                *error = LumenBrightnessError(-36, message);
+            }
+            return NO;
+        }
+
+        mapping.commandInFlight = YES;
+        mapping.rateLimited = NO;
+        if ([command isEqualToString:@"read"]) {
+            mapping.lastReadAttemptTimestamp = now;
+        } else {
+            mapping.lastWriteAttemptTimestamp = now;
+        }
+        return YES;
+    }
+}
+
+- (void)finishDDCCommand:(NSString *)command mapping:(LumenDDCMapping *)mapping success:(BOOL)success error:(NSError *)commandError startedAt:(NSTimeInterval)startedAt {
+    NSTimeInterval finishedAt = [NSDate timeIntervalSinceReferenceDate];
+    NSTimeInterval duration = finishedAt - startedAt;
+    @synchronized (mapping) {
+        mapping.commandInFlight = NO;
+        mapping.lastCommandTime = finishedAt;
+        if ([command isEqualToString:@"read"]) {
+            mapping.lastReadDuration = duration;
+            if (success) {
+                mapping.lastReadSuccessTimestamp = finishedAt;
+                mapping.lastReadError = @"";
+                mapping.consecutiveReadFailures = 0;
+                mapping.backendState = duration > LumenDDCSlowCommandThreshold ? @"DDC-CI read/write slow" : @"DDC-CI read/write";
+            } else {
+                mapping.lastReadError = commandError.localizedDescription ?: @"DDC/CI brightness read failed";
+                mapping.consecutiveReadFailures++;
+                mapping.backendState = @"DDC-CI set-only";
+            }
+        } else {
+            mapping.lastWriteDuration = duration;
+            if (success) {
+                mapping.lastWriteSuccessTimestamp = finishedAt;
+                mapping.lastWriteError = @"";
+                mapping.consecutiveWriteFailures = 0;
+                mapping.backendState = duration > LumenDDCSlowCommandThreshold ? @"DDC-CI set-only slow" : @"DDC-CI set-only";
+            } else {
+                mapping.lastWriteError = commandError.localizedDescription ?: @"DDC/CI brightness write failed";
+                mapping.consecutiveWriteFailures++;
+                mapping.backendState = @"DDC-CI transient failure";
+            }
+        }
+
+        if (duration > LumenDDCSlowCommandThreshold || (!success && [command isEqualToString:@"write"])) {
+            mapping.degradedUntil = finishedAt + LumenDDCDegradedCooldown;
+            mapping.degradedReason = [NSString stringWithFormat:@"DDC-CI %@ %@ (%.3fs)",
+                                      command,
+                                      success ? @"slow" : @"failed",
+                                      duration];
+            mapping.backendState = @"DDC-CI degraded";
+        }
+    }
+
+    os_log_debug(LumenDebugLog(),
+                 "DDC %{public}@ end success=%{public}@ duration=%{public}.3f",
+                 command,
+                 success ? @"YES" : @"NO",
+                 duration);
+    [self notifyDebugStateChanged];
+}
+
+- (void)notifyDebugStateChanged {
+    if (self.debugUpdateHandler) {
+        self.debugUpdateHandler();
+    }
 }
 
 - (BOOL)intelSendRequest:(IOI2CRequest *)request mapping:(LumenDDCMapping *)mapping {
@@ -837,8 +1141,28 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         self.displayKeyByStream = [NSMutableDictionary new];
         self.displayStatesByKey = [NSMutableDictionary new];
         self.debugEvents = [NSMutableArray new];
+        self.controllerQueue = dispatch_queue_create("com.anishathalye.lumen.controller", DISPATCH_QUEUE_SERIAL);
+        self.sampleQueue = dispatch_queue_create("com.anishathalye.lumen.samples", DISPATCH_QUEUE_CONCURRENT);
+        self.snapshotQueue = dispatch_queue_create("com.anishathalye.lumen.snapshot", DISPATCH_QUEUE_CONCURRENT);
+        self.processingSampleDisplayKeys = [NSMutableSet new];
+        self.latestDebugSnapshot = @{@"running": @NO,
+                                     @"version": @0,
+                                     @"generatedAt": @([NSDate timeIntervalSinceReferenceDate]),
+                                     @"displays": @[],
+                                     @"events": @[]};
+        ExternalDisplayBrightnessBackend *ddcBackend = [ExternalDisplayBrightnessBackend new];
+        __weak typeof(self) weakSelf = self;
+        ddcBackend.debugUpdateHandler = ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) {
+                return;
+            }
+            dispatch_async(strongSelf.controllerQueue, ^{
+                [strongSelf updateDebugSnapshot];
+            });
+        };
         self.brightnessBackends = @[[DisplayServicesBrightnessBackend new],
-                                    [ExternalDisplayBrightnessBackend new]];
+                                    ddcBackend];
         self.model = [Model new];
         self.ignoreList = [[IgnoreListController alloc] init];
         self.lastActiveAppURLString = @"";
@@ -861,7 +1185,9 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         CGDisplayRegisterReconfigurationCallback(LumenDisplayReconfigurationCallback, (__bridge void *)self);
         self.displayCallbackRegistered = YES;
     }
-    [self reloadDisplaysAndStreams];
+    dispatch_async(self.controllerQueue, ^{
+        [self reloadDisplaysAndStreams];
+    });
 }
 
 - (void)stop {
@@ -870,7 +1196,10 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         CGDisplayRemoveReconfigurationCallback(LumenDisplayReconfigurationCallback, (__bridge void *)self);
         self.displayCallbackRegistered = NO;
     }
-    [self stopCaptureStreams];
+    dispatch_async(self.controllerQueue, ^{
+        [self stopCaptureStreams];
+        [self updateDebugSnapshot];
+    });
 }
 
 - (void)reloadDisplaysAndStreams {
@@ -889,8 +1218,10 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         id<LumenBrightnessBackend> backend = [self backendForDisplay:display];
         display.brightnessControllable = backend != nil;
         display.brightnessBackendName = backend ? backend.name : @"unsupported";
-        state.canReadBrightness = backend != nil;
-        state.canSetBrightness = backend != nil;
+        state.canReadBrightness = backend != nil && (![backend respondsToSelector:@selector(canReadDisplay:)] || [backend canReadDisplay:display]);
+        state.canSetBrightness = backend != nil && (![backend respondsToSelector:@selector(canSetDisplay:)] || [backend canSetDisplay:display]);
+        state.hasValidBrightnessBaseline = NO;
+        state.noticed = NO;
 
         if (display.brightnessControllable) {
             NSUInteger beforeSampleCount = [self.model debugSampleCountForDisplayKey:display.stableKey];
@@ -929,9 +1260,10 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     }
     self.activeDisplays = displays;
     self.displayStatesByKey = states;
+    [self updateDebugSnapshot];
 
     [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
+        dispatch_async(self.controllerQueue, ^{
             if (!self.running || generation != self.displayConfigurationGeneration) {
                 return;
             }
@@ -943,6 +1275,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                     [self setAction:@"skipped: no capture" reason:@"skipped no screen capture permission" display:display state:state];
                     [self addDebugEvent:[NSString stringWithFormat:@"screen capture unavailable: %@", error.localizedDescription] display:display];
                 }
+                [self updateDebugSnapshot];
                 return;
             }
 
@@ -967,6 +1300,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                 }
                 [self startCaptureForDisplay:display captureDisplay:captureDisplay generation:generation];
             }
+            [self updateDebugSnapshot];
         });
     }];
 }
@@ -993,7 +1327,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     }
 
     NSError *streamError = nil;
-    [stream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:dispatch_get_main_queue() error:&streamError];
+    [stream addStreamOutput:self type:SCStreamOutputTypeScreen sampleHandlerQueue:self.sampleQueue error:&streamError];
     if (streamError) {
         LumenDisplayState *state = self.displayStatesByKey[display.stableKey];
         state.captureStatus = @"stream output failed";
@@ -1004,10 +1338,12 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
 
     NSValue *streamKey = [NSValue valueWithNonretainedObject:stream];
     self.streamsByDisplayKey[display.stableKey] = stream;
-    self.displayKeyByStream[streamKey] = display.stableKey;
+    @synchronized (self.displayKeyByStream) {
+        self.displayKeyByStream[streamKey] = display.stableKey;
+    }
 
     [stream startCaptureWithCompletionHandler:^(NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
+        dispatch_async(self.controllerQueue, ^{
             if (!self.running || generation != self.displayConfigurationGeneration) {
                 return;
             }
@@ -1032,6 +1368,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                             display.displayName,
                             [self shortDisplayKey:display.stableKey]);
             }
+            [self updateDebugSnapshot];
         });
     }];
 }
@@ -1052,7 +1389,9 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         state.captureActive = NO;
     }
     [self.streamsByDisplayKey removeAllObjects];
-    [self.displayKeyByStream removeAllObjects];
+    @synchronized (self.displayKeyByStream) {
+        [self.displayKeyByStream removeAllObjects];
+    }
 }
 
 - (BOOL)checkIgnoreList {
@@ -1137,26 +1476,77 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         return;
     }
 
-    NSError *brightnessError = nil;
-    float setPoint = [self brightnessForDisplay:display error:&brightnessError];
-    if (brightnessError) {
-        state.canReadBrightness = NO;
-        state.lastReadError = brightnessError.localizedDescription ?: @"brightness read failed";
-        [self setAction:@"skipped: unreadable brightness" reason:@"unreadable brightness" display:display state:state];
+    if (lightness <= 0) {
+        state.lastTrainingDecision = @"not trained: no sample";
+        [self setAction:@"skipped: no sample" reason:@"no current sample" display:display state:state];
         [self addSkippedDecisionEventForDisplay:display
                                           state:state
                                       lightness:lightness
                                          target:brightness
                               currentBrightness:state.latestBrightness
-                                         reason:@"unreadable brightness"];
+                                         reason:@"no sample"];
+        return;
+    }
+
+    NSError *brightnessError = nil;
+    float setPoint = [self brightnessForDisplay:display error:&brightnessError];
+    if (brightnessError) {
+        state.canReadBrightness = NO;
+        state.hasValidBrightnessBaseline = NO;
+        state.noticed = NO;
+        state.lastReadError = brightnessError.localizedDescription ?: @"brightness read failed";
+        state.latestBrightness = -1;
+        state.latestBrightnessTime = 0;
+        state.lastTrainingDecision = @"not trained: brightness unreadable";
         [self addDebugEvent:[NSString stringWithFormat:@"brightness read failed: %@", state.lastReadError] display:display];
         os_log_error(LumenDebugLog(),
                      "Brightness read failed display=%{public}@ key=%{public}@ error=%{public}@",
                      display.displayName,
                      [self shortDisplayKey:display.stableKey],
                      state.lastReadError);
-        display.brightnessControllable = NO;
-        display.brightnessBackendName = @"unsupported";
+
+        if (currentTime - state.lastAutoBrightnessTime < DEBOUNCE_DELAY) {
+            [self setAction:@"skipped: debounce" reason:@"brightness read unavailable" display:display state:state];
+            [self addSkippedDecisionEventForDisplay:display
+                                              state:state
+                                          lightness:lightness
+                                             target:brightness
+                                  currentBrightness:-1
+                                             reason:@"debounce"];
+            return;
+        }
+        if (brightness == state.lastAssigned) {
+            [self setAction:@"skipped: unchanged" reason:@"brightness read unavailable" display:display state:state];
+            [self addSkippedDecisionEventForDisplay:display
+                                              state:state
+                                          lightness:lightness
+                                             target:brightness
+                                  currentBrightness:-1
+                                             reason:@"unchanged"];
+            return;
+        }
+
+        NSError *setOnlyError = nil;
+        if ([self setBrightness:brightness forDisplay:display updateState:NO error:&setOnlyError]) {
+            state.canSetBrightness = YES;
+            state.lastWriteError = @"";
+            state.lastWrittenBrightness = brightness;
+            state.lastWriteTime = currentTime;
+            state.lastAssigned = brightness;
+            state.lastAutoBrightnessTime = currentTime;
+            [self setAction:[NSString stringWithFormat:@"set-only write %.3f", brightness] reason:@"brightness read unavailable" display:display state:state];
+            [self addDebugEvent:[NSString stringWithFormat:@"set-only brightness write %.3f; read unavailable", brightness] display:display];
+        } else {
+            state.canSetBrightness = YES;
+            state.lastWriteError = setOnlyError.localizedDescription ?: @"brightness write failed";
+            [self setAction:@"skipped: write failed" reason:@"write failed" display:display state:state];
+            [self addSkippedDecisionEventForDisplay:display
+                                              state:state
+                                          lightness:lightness
+                                             target:brightness
+                                  currentBrightness:-1
+                                             reason:@"write failed"];
+        }
         return;
     }
     state.canReadBrightness = YES;
@@ -1164,15 +1554,23 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     state.latestBrightness = setPoint;
     state.latestBrightnessTime = currentTime;
 
-    if (state.noticed || fabsf(state.lastSet - setPoint) > CHANGE_NOTICE) {
+    if (!state.hasValidBrightnessBaseline) {
+        [self initialiseBrightnessBaseline:setPoint display:display state:state time:currentTime];
+    } else if ([self isOwnWriteReadback:setPoint state:state time:currentTime]) {
+        state.noticed = NO;
+        state.lastSet = setPoint;
+        state.brightnessBaseline = setPoint;
+        state.brightnessBaselineTime = currentTime;
+        [self markManualOverrideIgnored:@"not trained: own write debounce" display:display state:state time:currentTime];
+    } else if (state.noticed || fabsf(state.brightnessBaseline - setPoint) > CHANGE_NOTICE) {
         if (!state.noticed) {
             state.noticed = YES;
-            state.lastManualOverrideOldBrightness = state.lastSet;
+            state.lastManualOverrideOldBrightness = state.brightnessBaseline;
             state.lastManualOverrideNewBrightness = setPoint;
-            state.lastManualOverrideDelta = state.lastSet >= 0 ? setPoint - state.lastSet : 0;
+            state.lastManualOverrideDelta = setPoint - state.brightnessBaseline;
             state.lastNoticed = setPoint;
             state.lastManualChangeTime = currentTime;
-            state.lastTrainingDecision = @"pending: manual override debounce";
+            state.lastTrainingDecision = @"not trained: manual override debounce";
             [self setAction:@"skipped: debounce" reason:@"debounce" display:display state:state];
             [self addSkippedDecisionEventForDisplay:display
                                               state:state
@@ -1188,10 +1586,10 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         }
         if (fabsf(setPoint - state.lastNoticed) > CHANGE_NOTICE) {
             state.lastManualOverrideNewBrightness = setPoint;
-            state.lastManualOverrideDelta = state.lastManualOverrideOldBrightness >= 0 ? setPoint - state.lastManualOverrideOldBrightness : 0;
+            state.lastManualOverrideDelta = setPoint - state.lastManualOverrideOldBrightness;
             state.lastNoticed = setPoint;
             state.lastManualChangeTime = currentTime;
-            state.lastTrainingDecision = @"pending: manual override changing";
+            state.lastTrainingDecision = @"not trained: manual override debounce";
             [self setAction:@"skipped: debounce" reason:@"debounce" display:display state:state];
             [self addSkippedDecisionEventForDisplay:display
                                               state:state
@@ -1201,7 +1599,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                                              reason:@"debounce"];
             return;
         } else if (currentTime - state.lastManualChangeTime < DEBOUNCE_DELAY) {
-            state.lastTrainingDecision = @"pending: manual override debounce";
+            state.lastTrainingDecision = @"not trained: manual override debounce";
             [self setAction:@"skipped: debounce" reason:@"debounce" display:display state:state];
             [self addSkippedDecisionEventForDisplay:display
                                               state:state
@@ -1213,14 +1611,17 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         } else if (state.shouldIgnoreOutput) {
             state.shouldIgnoreOutput = NO;
             state.noticed = NO;
-            state.lastTrainingDecision = @"ignored: self-write or ignored app";
+            state.lastSet = setPoint;
+            state.brightnessBaseline = setPoint;
+            state.brightnessBaselineTime = currentTime;
+            state.lastTrainingDecision = @"not trained: own write debounce";
             state.lastLearnEvent = [NSString stringWithFormat:@"ignored %.3f @ %@", setPoint, [self formattedTime:currentTime]];
             [self addDebugEvent:@"manual-looking change ignored" display:display];
         } else {
             [self.model observeOutput:setPoint forInput:lightness displayKey:display.stableKey];
             state.lastLearnTime = currentTime;
             state.lastManualOverrideNewBrightness = setPoint;
-            state.lastManualOverrideDelta = state.lastManualOverrideOldBrightness >= 0 ? setPoint - state.lastManualOverrideOldBrightness : 0;
+            state.lastManualOverrideDelta = setPoint - state.lastManualOverrideOldBrightness;
             state.lastLearnEvent = [NSString stringWithFormat:@"manual %.3f @ %@", setPoint, [self formattedTime:currentTime]];
             state.lastTrainingDecision = @"trained: manual override";
             [self addDebugEvent:[NSString stringWithFormat:@"model trained manual brightness %.3f at L*=%.2f", setPoint, lightness]
@@ -1233,9 +1634,16 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                         setPoint,
                         state.lastManualOverrideDelta);
             state.noticed = NO;
+            state.lastSet = setPoint;
+            state.brightnessBaseline = setPoint;
+            state.brightnessBaselineTime = currentTime;
         }
     } else {
-        state.lastTrainingDecision = @"not trained: no manual override";
+        state.noticed = NO;
+        state.lastSet = setPoint;
+        state.brightnessBaseline = setPoint;
+        state.brightnessBaselineTime = currentTime;
+        state.lastTrainingDecision = @"not trained: within tolerance";
     }
 
     if (currentTime - state.lastAutoBrightnessTime < DEBOUNCE_DELAY) {
@@ -1250,7 +1658,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     }
 
     if (brightness == state.lastAssigned) {
-        [self setAction:@"unchanged" reason:@"unchanged within tolerance" display:display state:state];
+        [self setAction:@"skipped: unchanged" reason:@"unchanged within tolerance" display:display state:state];
         [self addSkippedDecisionEventForDisplay:display
                                           state:state
                                       lightness:lightness
@@ -1277,7 +1685,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                     lightness,
                     brightness);
     } else {
-        state.canSetBrightness = NO;
+        state.canSetBrightness = YES;
         state.lastWriteError = setError.localizedDescription ?: @"brightness write failed";
         [self setAction:@"skipped: write failed" reason:@"write failed" display:display state:state];
         [self addSkippedDecisionEventForDisplay:display
@@ -1293,8 +1701,6 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                      [self shortDisplayKey:display.stableKey],
                      brightness,
                      state.lastWriteError);
-        display.brightnessControllable = NO;
-        display.brightnessBackendName = @"unsupported";
     }
 }
 
@@ -1343,11 +1749,19 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     state.lastWrittenBrightness = brightness;
     state.lastWriteTime = [NSDate timeIntervalSinceReferenceDate];
 
-    if (updateState) {
+    BOOL shouldReadBack = updateState;
+    if ([backend respondsToSelector:@selector(shouldReadBackAfterWrite)]) {
+        shouldReadBack = updateState && [backend shouldReadBackAfterWrite];
+    }
+
+    if (shouldReadBack) {
         NSError *readBackError = nil;
         float readBack = [backend brightnessForDisplay:display error:&readBackError];
         if (!readBackError) {
             state.lastSet = readBack;
+            state.hasValidBrightnessBaseline = YES;
+            state.brightnessBaseline = readBack;
+            state.brightnessBaselineTime = [NSDate timeIntervalSinceReferenceDate];
             state.latestBrightness = readBack;
             state.latestBrightnessTime = [NSDate timeIntervalSinceReferenceDate];
             state.canReadBrightness = YES;
@@ -1360,23 +1774,16 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
 }
 
 - (NSArray<NSDictionary<NSString *, id> *> *)displayDebugStatuses {
-    NSMutableArray<NSDictionary<NSString *, id> *> *statuses = [NSMutableArray new];
-    for (LumenDisplay *display in self.activeDisplays) {
-        [statuses addObject:[self debugDictionaryForDisplay:display]];
-    }
-    return statuses;
+    NSArray *statuses = [self debugSnapshot][@"displays"];
+    return [statuses isKindOfClass:[NSArray class]] ? statuses : @[];
 }
 
 - (NSDictionary<NSString *, id> *)debugSnapshot {
-    NSMutableArray *displays = [NSMutableArray new];
-    for (LumenDisplay *display in self.activeDisplays) {
-        [displays addObject:[self debugDictionaryForDisplay:display]];
-    }
-
-    return @{@"running": @(self.running),
-             @"generatedAt": @([NSDate timeIntervalSinceReferenceDate]),
-             @"displays": displays,
-             @"events": self.debugEvents.copy};
+    __block NSDictionary *snapshot = nil;
+    dispatch_sync(self.snapshotQueue, ^{
+        snapshot = self.latestDebugSnapshot ?: @{};
+    });
+    return snapshot;
 }
 
 - (NSString *)debugSnapshotText {
@@ -1389,6 +1796,64 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         return [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
     }
     return [snapshot description];
+}
+
+- (void)recordDebugPanelRenderDuration:(NSTimeInterval)duration {
+    dispatch_async(self.controllerQueue, ^{
+        self.debugPanelLastRenderDuration = duration;
+        dispatch_barrier_async(self.snapshotQueue, ^{
+            NSMutableDictionary *snapshot = [self.latestDebugSnapshot mutableCopy] ?: [NSMutableDictionary new];
+            snapshot[@"debugPanelLastRenderDuration"] = @(duration);
+            self.latestDebugSnapshot = snapshot.copy;
+        });
+    });
+}
+
+- (void)resetLearnedCalibrationForDebug {
+    dispatch_async(self.controllerQueue, ^{
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        [defaults removeObjectForKey:DEFAULTS_DISPLAY_CALIBRATION_POINTS];
+        [defaults removeObjectForKey:DEFAULTS_CALIBRATION_POINTS];
+        [defaults removeObjectForKey:DEFAULTS_CALIBRATION_POINTS_MIGRATED];
+        [defaults synchronize];
+
+        self.model = [Model new];
+        for (LumenDisplay *display in self.activeDisplays) {
+            LumenDisplayState *state = self.displayStatesByKey[display.stableKey];
+            state.seededFromLegacyModel = NO;
+            state.lastLearnEvent = @"none";
+            state.lastLearnTime = 0;
+            state.lastTrainingDecision = @"not trained: calibration reset";
+            [self addDebugEvent:@"learned calibration reset" display:display];
+        }
+        [self updateDebugSnapshot];
+    });
+}
+
+- (void)updateDebugSnapshot {
+    NSTimeInterval startedAt = [NSDate timeIntervalSinceReferenceDate];
+    NSMutableArray *displays = [NSMutableArray new];
+    for (LumenDisplay *display in self.activeDisplays) {
+        [displays addObject:[self debugDictionaryForDisplay:display]];
+    }
+
+    self.snapshotGenerationDuration = [NSDate timeIntervalSinceReferenceDate] - startedAt;
+    self.debugSnapshotVersion++;
+    NSDictionary *snapshot = @{@"running": @(self.running),
+                               @"version": @(self.debugSnapshotVersion),
+                               @"generatedAt": @([NSDate timeIntervalSinceReferenceDate]),
+                               @"lastControlLoopDuration": @(self.lastControlLoopDuration),
+                               @"snapshotGenerationDuration": @(self.snapshotGenerationDuration),
+                               @"debugPanelLastRenderDuration": @(self.debugPanelLastRenderDuration),
+                               @"displays": displays.copy,
+                               @"events": self.debugEvents.copy};
+    dispatch_barrier_async(self.snapshotQueue, ^{
+        self.latestDebugSnapshot = snapshot;
+    });
+    os_log_debug(LumenDebugLog(),
+                 "Snapshot update version=%{public}lu duration=%{public}.3f",
+                 (unsigned long)self.debugSnapshotVersion,
+                 self.snapshotGenerationDuration);
 }
 
 - (NSDictionary<NSString *, id> *)debugDictionaryForDisplay:(LumenDisplay *)display {
@@ -1410,49 +1875,66 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     }
 
     float normalizedLightness = state.latestLightness >= 0 ? state.latestLightness / 100.0 : -1;
-    return @{@"name": display.displayName ?: @"",
-             @"display": display.displayName ?: @"",
-             @"key": display.stableKey ?: @"",
-             @"debugKey": [self shortDisplayKey:display.stableKey],
-             @"displayID": @(display.displayID),
-             @"role": [self roleForDisplay:display],
-             @"builtin": @(display.builtin),
-             @"main": @(display.displayID == CGMainDisplayID()),
-             @"bounds": NSStringFromRect(NSRectFromCGRect(display.bounds)),
-             @"scaleFactor": @(scaleFactor),
-             @"controllable": @(display.brightnessControllable),
-             @"backend": display.brightnessBackendName ?: @"unsupported",
-             @"captureStatus": state.captureStatus ?: @"unknown",
-             @"captureActive": @(state.captureActive),
-             @"lightness": @(normalizedLightness),
-             @"lightnessLStar": @(state.latestLightness),
-             @"lightnessTimestamp": @(state.latestLightnessTime),
-             @"brightness": @(state.latestBrightness),
-             @"brightnessTimestamp": @(state.latestBrightnessTime),
-             @"target": @(state.latestTargetBrightness),
-             @"targetTimestamp": @(state.latestTargetTime),
-             @"action": state.lastAction ?: @"unknown",
-             @"actionReason": state.lastActionReason ?: @"unknown",
-             @"model": modelState,
-             @"modelSampleCount": @(sampleCount),
-             @"modelHasData": @(learned),
-             @"learned": @(learned),
-             @"modelRange": [self.model debugRangeSummaryForDisplayKey:display.stableKey] ?: @"",
-             @"learnedPoints": [self.model debugLearnedPointsSummaryForDisplayKey:display.stableKey] ?: @"",
-             @"lastLearn": state.lastLearnEvent ?: @"none",
-             @"lastLearnTimestamp": @(state.lastLearnTime),
-             @"trainingDecision": state.lastTrainingDecision ?: @"none",
-             @"manualOldBrightness": @(state.lastManualOverrideOldBrightness),
-             @"manualNewBrightness": @(state.lastManualOverrideNewBrightness),
-             @"manualDelta": @(state.lastManualOverrideDelta),
-             @"lastManualOverrideTimestamp": @(state.lastManualChangeTime),
-             @"canReadBrightness": @(state.canReadBrightness),
-             @"canSetBrightness": @(state.canSetBrightness),
-             @"lastReadBrightness": @(state.latestBrightness),
-             @"lastWrittenBrightness": @(state.lastWrittenBrightness),
-             @"lastWriteTimestamp": @(state.lastWriteTime),
-             @"lastWriteError": state.lastWriteError ?: @"",
-             @"lastReadError": state.lastReadError ?: @""};
+    NSMutableDictionary *debug = [@{@"name": display.displayName ?: @"",
+                                    @"display": display.displayName ?: @"",
+                                    @"key": display.stableKey ?: @"",
+                                    @"debugKey": [self shortDisplayKey:display.stableKey],
+                                    @"displayID": @(display.displayID),
+                                    @"role": [self roleForDisplay:display],
+                                    @"builtin": @(display.builtin),
+                                    @"main": @(display.displayID == CGMainDisplayID()),
+                                    @"bounds": NSStringFromRect(NSRectFromCGRect(display.bounds)),
+                                    @"scaleFactor": @(scaleFactor),
+                                    @"controllable": @(display.brightnessControllable),
+                                    @"backend": display.brightnessBackendName ?: @"unsupported",
+                                    @"captureStatus": state.captureStatus ?: @"unknown",
+                                    @"captureActive": @(state.captureActive),
+                                    @"lightness": @(normalizedLightness),
+                                    @"lightnessLStar": @(state.latestLightness),
+                                    @"lightnessTimestamp": @(state.latestLightnessTime),
+                                    @"brightness": @(state.latestBrightness),
+                                    @"brightnessTimestamp": @(state.latestBrightnessTime),
+                                    @"target": @(state.latestTargetBrightness),
+                                    @"targetTimestamp": @(state.latestTargetTime),
+                                    @"action": state.lastAction ?: @"unknown",
+                                    @"actionReason": state.lastActionReason ?: @"unknown",
+                                    @"actionTimestamp": @(state.lastDecisionTime),
+                                    @"lastControlLoopDuration": @(self.lastControlLoopDuration),
+                                    @"snapshotGenerationDuration": @(self.snapshotGenerationDuration),
+                                    @"debugPanelLastRenderDuration": @(self.debugPanelLastRenderDuration),
+                                    @"droppedSampleCount": @(state.droppedSampleCount),
+                                    @"model": modelState,
+                                    @"modelSampleCount": @(sampleCount),
+                                    @"modelHasData": @(learned),
+                                    @"learned": @(learned),
+                                    @"modelRange": [self.model debugRangeSummaryForDisplayKey:display.stableKey] ?: @"",
+                                    @"learnedPoints": [self.model debugLearnedPointsSummaryForDisplayKey:display.stableKey] ?: @"",
+                                    @"lastLearn": state.lastLearnEvent ?: @"none",
+                                    @"lastLearnTimestamp": @(state.lastLearnTime),
+                                    @"trainingDecision": state.lastTrainingDecision ?: @"none",
+                                    @"manualOldBrightness": @(state.lastManualOverrideOldBrightness),
+                                    @"manualNewBrightness": @(state.lastManualOverrideNewBrightness),
+                                    @"manualDelta": @(state.lastManualOverrideDelta),
+                                    @"lastManualOverrideTimestamp": @(state.lastManualChangeTime),
+                                    @"canReadBrightness": @(state.canReadBrightness),
+                                    @"canSetBrightness": @(state.canSetBrightness),
+                                    @"lastReadBrightness": @(state.latestBrightness),
+                                    @"hasValidBrightnessBaseline": @(state.hasValidBrightnessBaseline),
+                                    @"brightnessBaseline": @(state.brightnessBaseline),
+                                    @"brightnessBaselineTimestamp": @(state.brightnessBaselineTime),
+                                    @"lastWrittenBrightness": @(state.lastWrittenBrightness),
+                                    @"lastWriteTimestamp": @(state.lastWriteTime),
+                                    @"lastWriteError": state.lastWriteError ?: @"",
+                                    @"lastReadError": state.lastReadError ?: @""} mutableCopy];
+    id<LumenBrightnessBackend> backend = [self backendForDisplay:display];
+    if ([backend respondsToSelector:@selector(debugInfoForDisplay:)]) {
+        [debug addEntriesFromDictionary:[backend debugInfoForDisplay:display]];
+    } else if (display.brightnessControllable) {
+        debug[@"backendState"] = @"read/write";
+    } else {
+        debug[@"backendState"] = @"unsupported";
+    }
+    return debug;
 }
 
 - (void)addDebugEvent:(NSString *)event display:(LumenDisplay *)display {
@@ -1519,6 +2001,48 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                  reason ?: @"unknown");
 }
 
+- (void)initialiseBrightnessBaseline:(float)brightness display:(LumenDisplay *)display state:(LumenDisplayState *)state time:(NSTimeInterval)time {
+    state.hasValidBrightnessBaseline = YES;
+    state.brightnessBaseline = brightness;
+    state.brightnessBaselineTime = time;
+    state.lastSet = brightness;
+    state.noticed = NO;
+    state.lastTrainingDecision = @"not trained: baseline initialised";
+    state.lastManualOverrideOldBrightness = -1;
+    state.lastManualOverrideNewBrightness = brightness;
+    state.lastManualOverrideDelta = 0;
+
+    if (time - state.lastBaselineEventTime > LumenNoisyDebugEventInterval) {
+        state.lastBaselineEventTime = time;
+        [self addDebugEvent:[NSString stringWithFormat:@"brightness baseline initialised %.3f", brightness]
+                    display:display];
+        os_log_info(LumenDebugLog(),
+                    "Brightness baseline initialised display=%{public}@ key=%{public}@ brightness=%{public}.3f",
+                    display.displayName,
+                    [self shortDisplayKey:display.stableKey],
+                    brightness);
+    }
+}
+
+- (void)markManualOverrideIgnored:(NSString *)decision display:(LumenDisplay *)display state:(LumenDisplayState *)state time:(NSTimeInterval)time {
+    state.lastTrainingDecision = decision ?: @"not trained: no valid previous brightness";
+    if (time - state.lastIgnoredManualEventTime > LumenNoisyDebugEventInterval) {
+        state.lastIgnoredManualEventTime = time;
+        [self addDebugEvent:state.lastTrainingDecision display:display];
+    }
+}
+
+- (BOOL)isOwnWriteReadback:(float)brightness state:(LumenDisplayState *)state time:(NSTimeInterval)time {
+    if (state.lastWrittenBrightness < 0 || state.lastWriteTime <= 0) {
+        return NO;
+    }
+
+    BOOL recentWrite = time - state.lastWriteTime < LumenOwnWriteReadbackDebounce;
+    BOOL matchesLastWrite = fabsf(brightness - state.lastWrittenBrightness) <= CHANGE_NOTICE;
+    BOOL matchesLastAssigned = state.lastAssigned >= 0 && fabsf(brightness - state.lastAssigned) <= CHANGE_NOTICE;
+    return recentWrite || matchesLastWrite || matchesLastAssigned;
+}
+
 - (void)setAction:(NSString *)action reason:(NSString *)reason display:(LumenDisplay *)display state:(LumenDisplayState *)state {
     if (!state) {
         return;
@@ -1526,6 +2050,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     BOOL changed = ![state.lastAction isEqualToString:action] || ![state.lastActionReason isEqualToString:reason];
     state.lastAction = action ?: @"unknown";
     state.lastActionReason = reason ?: @"unknown";
+    state.lastDecisionTime = [NSDate timeIntervalSinceReferenceDate];
     if (changed) {
         [self addDebugEvent:[NSString stringWithFormat:@"%@ (%@)", state.lastAction, state.lastActionReason]
                     display:display];
@@ -1670,55 +2195,104 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         return;
     }
 
-    NSString *displayKey = self.displayKeyByStream[[NSValue valueWithNonretainedObject:stream]];
-    LumenDisplay *display = [self displayForKey:displayKey];
-    if (!display) {
+    __block NSString *displayKey = nil;
+    @synchronized (self.displayKeyByStream) {
+        displayKey = self.displayKeyByStream[[NSValue valueWithNonretainedObject:stream]];
+    }
+    if (displayKey.length == 0) {
+        return;
+    }
+
+    BOOL shouldDrop = NO;
+    @synchronized (self.processingSampleDisplayKeys) {
+        shouldDrop = [self.processingSampleDisplayKeys containsObject:displayKey];
+        if (!shouldDrop) {
+            [self.processingSampleDisplayKeys addObject:displayKey];
+        }
+    }
+
+    if (shouldDrop) {
+        dispatch_async(self.controllerQueue, ^{
+            LumenDisplayState *state = self.displayStatesByKey[displayKey];
+            state.droppedSampleCount++;
+        });
         return;
     }
 
     double lightness = [self computeLightnessFromSampleBuffer:sampleBuffer];
-    if (lightness <= 0) {
-        LumenDisplayState *state = self.displayStatesByKey[display.stableKey];
-        [self setAction:@"skipped: no sample" reason:@"skipped no screen capture permission" display:display state:state];
-        return;
-    }
+    dispatch_async(self.controllerQueue, ^{
+        if (!self.running) {
+            @synchronized (self.processingSampleDisplayKeys) {
+                [self.processingSampleDisplayKeys removeObject:displayKey];
+            }
+            return;
+        }
+        NSTimeInterval controlStartedAt = [NSDate timeIntervalSinceReferenceDate];
+        os_log_debug(LumenDebugLog(), "Control loop start");
 
-    [(NSMutableDictionary *)self.currentLightnessByDisplayKey setObject:@(lightness) forKey:display.stableKey];
-    LumenDisplayState *state = self.displayStatesByKey[display.stableKey];
-    state.latestLightness = lightness;
-    state.latestLightnessTime = [NSDate timeIntervalSinceReferenceDate];
-    state.captureActive = YES;
-    state.captureStatus = @"active";
-    if (state.latestLightnessTime - state.lastLightnessLogTime > 10) {
-        state.lastLightnessLogTime = state.latestLightnessTime;
+        LumenDisplay *display = [self displayForKey:displayKey];
+        if (display) {
+            if (lightness <= 0) {
+                LumenDisplayState *state = self.displayStatesByKey[display.stableKey];
+                if (state.latestLightnessTime <= 0) {
+                    state.lastTrainingDecision = @"not trained: no sample";
+                    [self setAction:@"skipped: no sample" reason:@"no current sample" display:display state:state];
+                }
+            } else {
+                [(NSMutableDictionary *)self.currentLightnessByDisplayKey setObject:@(lightness) forKey:display.stableKey];
+                LumenDisplayState *state = self.displayStatesByKey[display.stableKey];
+                state.latestLightness = lightness;
+                state.latestLightnessTime = [NSDate timeIntervalSinceReferenceDate];
+                state.captureActive = YES;
+                state.captureStatus = @"active";
+                if (state.latestLightnessTime - state.lastLightnessLogTime > 10) {
+                    state.lastLightnessLogTime = state.latestLightnessTime;
+                    os_log_debug(LumenDebugLog(),
+                                 "Lightness display=%{public}@ key=%{public}@ lightness=%{public}.2f",
+                                 display.displayName,
+                                 [self shortDisplayKey:display.stableKey],
+                                 lightness);
+                }
+
+                if (![self checkIgnoreList]) {
+                    [self processLightness:lightness forDisplay:display];
+                }
+            }
+        }
+
+        self.lastControlLoopDuration = [NSDate timeIntervalSinceReferenceDate] - controlStartedAt;
         os_log_debug(LumenDebugLog(),
-                     "Lightness display=%{public}@ key=%{public}@ lightness=%{public}.2f",
-                     display.displayName,
-                     [self shortDisplayKey:display.stableKey],
-                     lightness);
-    }
-
-    if ([self checkIgnoreList]) {
-        return;
-    }
-
-    [self processLightness:lightness forDisplay:display];
+                     "Control loop end duration=%{public}.3f",
+                     self.lastControlLoopDuration);
+        [self updateDebugSnapshot];
+        @synchronized (self.processingSampleDisplayKeys) {
+            [self.processingSampleDisplayKeys removeObject:displayKey];
+        }
+    });
 }
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
     if (error) {
         os_log_error(LumenDebugLog(), "Stream stopped with error: %{public}@", error.localizedDescription);
     }
-    NSString *displayKey = self.displayKeyByStream[[NSValue valueWithNonretainedObject:stream]];
+    __block NSString *displayKey = nil;
+    @synchronized (self.displayKeyByStream) {
+        displayKey = self.displayKeyByStream[[NSValue valueWithNonretainedObject:stream]];
+    }
     if (displayKey) {
-        LumenDisplay *display = [self displayForKey:displayKey];
-        LumenDisplayState *state = self.displayStatesByKey[displayKey];
-        state.captureActive = NO;
-        state.captureStatus = error ? @"stopped with error" : @"stopped";
-        [self addDebugEvent:error ? [NSString stringWithFormat:@"capture stopped: %@", error.localizedDescription] : @"capture stopped"
-                    display:display];
-        [self.streamsByDisplayKey removeObjectForKey:displayKey];
-        [self.displayKeyByStream removeObjectForKey:[NSValue valueWithNonretainedObject:stream]];
+        dispatch_async(self.controllerQueue, ^{
+            LumenDisplay *display = [self displayForKey:displayKey];
+            LumenDisplayState *state = self.displayStatesByKey[displayKey];
+            state.captureActive = NO;
+            state.captureStatus = error ? @"stopped with error" : @"stopped";
+            [self addDebugEvent:error ? [NSString stringWithFormat:@"capture stopped: %@", error.localizedDescription] : @"capture stopped"
+                        display:display];
+            [self.streamsByDisplayKey removeObjectForKey:displayKey];
+            @synchronized (self.displayKeyByStream) {
+                [self.displayKeyByStream removeObjectForKey:[NSValue valueWithNonretainedObject:stream]];
+            }
+            [self updateDebugSnapshot];
+        });
     }
 }
 

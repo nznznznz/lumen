@@ -18,6 +18,7 @@
 @property (nonatomic, strong) NSTimer *displayStatusTimer;
 @property (strong, nonatomic) NSMenuItem *displayStatusMenuItem;
 @property (strong, nonatomic) NSMenuItem *debugPanelMenuItem;
+@property (strong, nonatomic) NSMenuItem *resetCalibrationMenuItem;
 @property (strong, nonatomic) IgnoreListWindowController *ignoreListWC;
 @property (strong, nonatomic) DebugPanelWindowController *debugPanelWC;
 
@@ -107,6 +108,11 @@
                                                   keyEquivalent:@""];
     self.debugPanelMenuItem.target = self;
     [self.statusMenu insertItem:self.debugPanelMenuItem atIndex:3];
+    self.resetCalibrationMenuItem = [[NSMenuItem alloc] initWithTitle:@"Reset Learned Calibration"
+                                                               action:@selector(menuActionResetLearnedCalibration:)
+                                                        keyEquivalent:@""];
+    self.resetCalibrationMenuItem.target = self;
+    [self.statusMenu insertItem:self.resetCalibrationMenuItem atIndex:4];
     [self updateDebugPanelMenuItem];
 }
 
@@ -123,20 +129,40 @@
         self.debugPanelWC = [[DebugPanelWindowController alloc] initWithBrightnessController:self.brightnessController];
     }
     [self.debugPanelWC showPanel];
-    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:DEFAULTS_DEBUG_PANEL_VISIBLE];
+    [self setDebugPanelVisibleDefault:YES];
     [self updateDebugPanelMenuItem];
 }
 
 - (void)hideDebugPanel {
     [self.debugPanelWC hidePanel];
-    [[NSUserDefaults standardUserDefaults] setBool:NO forKey:DEFAULTS_DEBUG_PANEL_VISIBLE];
+    [self setDebugPanelVisibleDefault:NO];
     [self updateDebugPanelMenuItem];
 }
 
 - (void)debugPanelVisibilityChanged:(NSNotification *)notification {
     BOOL visible = self.debugPanelWC.window.visible;
-    [[NSUserDefaults standardUserDefaults] setBool:visible forKey:DEFAULTS_DEBUG_PANEL_VISIBLE];
+    [self setDebugPanelVisibleDefault:visible];
     [self updateDebugPanelMenuItem];
+}
+
+- (void)setDebugPanelVisibleDefault:(BOOL)visible {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        [[NSUserDefaults standardUserDefaults] setBool:visible forKey:DEFAULTS_DEBUG_PANEL_VISIBLE];
+    });
+}
+
+- (IBAction)menuActionResetLearnedCalibration:(id)sender {
+    NSAlert *alert = [NSAlert new];
+    alert.messageText = @"Reset learned calibration?";
+    alert.informativeText = @"This clears displayCalibrationPoints and calibrationPoints from Lumen defaults. Brightness baselines will be reinitialised from fresh display reads.";
+    [alert addButtonWithTitle:@"Reset"];
+    [alert addButtonWithTitle:@"Cancel"];
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return;
+    }
+
+    [self.brightnessController resetLearnedCalibrationForDebug];
+    [self updateDisplayStatusMenu];
 }
 
 - (void)updateDebugPanelMenuItem {
