@@ -8,4 +8,9 @@
 - (void)observeOutput:(float)output forInput:(float)input;
 - (float)predictFromInput:(float)input;
 
+- (void)ensureModelForDisplayKey:(NSString *)displayKey seedWithLegacyDefaults:(BOOL)seedWithLegacyDefaults;
+- (void)observeOutput:(float)output forInput:(float)input displayKey:(NSString *)displayKey;
+- (float)predictFromInput:(float)input displayKey:(NSString *)displayKey;
+- (BOOL)hasLearnedDataForDisplayKey:(NSString *)displayKey;
+
 @end

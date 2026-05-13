@@ -15,6 +15,8 @@
 #define TELEMETRY_INTERVAL (1 * 24 * 60 * 60) // seconds
 
 #define DEFAULTS_CALIBRATION_POINTS (@"calibrationPoints")
+#define DEFAULTS_DISPLAY_CALIBRATION_POINTS (@"displayCalibrationPoints")
+#define DEFAULTS_CALIBRATION_POINTS_MIGRATED (@"calibrationPointsMigratedToPerDisplay")
 #define DEFAULTS_IGNORE_LIST (@"ignoreList")
 
 #define NOTIFICATION_IGNORE_LIST_CHANGED (@"notification.ignoreListChanged")
