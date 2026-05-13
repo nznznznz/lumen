@@ -4,6 +4,23 @@
 #import "LumenDisplay.h"
 #import <AppKit/AppKit.h>
 #import <IOKit/graphics/IOGraphicsLib.h>
+#import <os/log.h>
+
+static NSString *LumenShortDisplayKey(NSString *stableKey) {
+    if (stableKey.length <= 8) {
+        return stableKey ?: @"";
+    }
+    return [stableKey substringFromIndex:stableKey.length - 8];
+}
+
+static os_log_t LumenDisplayLog(void) {
+    static os_log_t log;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        log = os_log_create("com.anishathalye.lumen", "display");
+    });
+    return log;
+}
 
 @implementation LumenDisplay
 
@@ -36,12 +53,13 @@
                                                                 builtin:builtin
                                                                  bounds:bounds];
         [displays addObject:display];
-        NSLog(@"Discovered display name='%@' id=%u key=%@ builtin=%@ bounds=%@",
-              display.displayName,
-              display.displayID,
-              display.stableKey,
-              display.builtin ? @"YES" : @"NO",
-              NSStringFromRect(NSRectFromCGRect(display.bounds)));
+        os_log_info(LumenDisplayLog(),
+                    "Discovered display name=%{public}@ id=%{public}u key=%{public}@ builtin=%{public}@ bounds=%{public}@",
+                    display.displayName,
+                    display.displayID,
+                    LumenShortDisplayKey(display.stableKey),
+                    display.builtin ? @"YES" : @"NO",
+                    NSStringFromRect(NSRectFromCGRect(display.bounds)));
     }
 
     return displays;

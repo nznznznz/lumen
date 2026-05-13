@@ -6,6 +6,7 @@
 #import "BrightnessController.h"
 #import "stats.h"
 #import "IgnoreListWindowController.h"
+#import "DebugPanelWindowController.h"
 
 @interface AppDelegate ()
 
@@ -16,7 +17,9 @@
 @property (nonatomic, strong) NSTimer *statsTimer;
 @property (nonatomic, strong) NSTimer *displayStatusTimer;
 @property (strong, nonatomic) NSMenuItem *displayStatusMenuItem;
+@property (strong, nonatomic) NSMenuItem *debugPanelMenuItem;
 @property (strong, nonatomic) IgnoreListWindowController *ignoreListWC;
+@property (strong, nonatomic) DebugPanelWindowController *debugPanelWC;
 
 @end
 
@@ -31,6 +34,7 @@
     [self.brightnessController start];
     [self.toggle setTitle:STOP];
     [self setupDisplayStatusMenu];
+    [self setupDebugPanelMenu];
 
     send_stats(TELEMETRY_RETRIES);
     self.statsTimer = [NSTimer scheduledTimerWithTimeInterval:TELEMETRY_INTERVAL
@@ -44,6 +48,14 @@
                                                              userInfo:nil
                                                               repeats:YES];
     [self updateDisplayStatusMenu];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(debugPanelVisibilityChanged:)
+                                                 name:LumenDebugPanelVisibilityChangedNotification
+                                               object:nil];
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:DEFAULTS_DEBUG_PANEL_VISIBLE]) {
+        [self showDebugPanel];
+    }
 }
 
 - (void)statsTick:(NSTimer *)timer {
@@ -53,6 +65,7 @@
 - (void)applicationWillTerminate:(NSNotification *)aNotification {
     [self.displayStatusTimer invalidate];
     [self.statsTimer invalidate];
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
 - (IBAction)menuActionQuit:(id)sender {
@@ -86,6 +99,50 @@
     self.displayStatusMenuItem = [[NSMenuItem alloc] initWithTitle:@"Displays" action:nil keyEquivalent:@""];
     self.displayStatusMenuItem.submenu = [[NSMenu alloc] initWithTitle:@"Displays"];
     [self.statusMenu insertItem:self.displayStatusMenuItem atIndex:2];
+}
+
+- (void)setupDebugPanelMenu {
+    self.debugPanelMenuItem = [[NSMenuItem alloc] initWithTitle:@"Show Debug Panel"
+                                                         action:@selector(menuActionToggleDebugPanel:)
+                                                  keyEquivalent:@""];
+    self.debugPanelMenuItem.target = self;
+    [self.statusMenu insertItem:self.debugPanelMenuItem atIndex:3];
+    [self updateDebugPanelMenuItem];
+}
+
+- (IBAction)menuActionToggleDebugPanel:(id)sender {
+    if (self.debugPanelWC.window.visible) {
+        [self hideDebugPanel];
+    } else {
+        [self showDebugPanel];
+    }
+}
+
+- (void)showDebugPanel {
+    if (!self.debugPanelWC) {
+        self.debugPanelWC = [[DebugPanelWindowController alloc] initWithBrightnessController:self.brightnessController];
+    }
+    [self.debugPanelWC showPanel];
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:DEFAULTS_DEBUG_PANEL_VISIBLE];
+    [self updateDebugPanelMenuItem];
+}
+
+- (void)hideDebugPanel {
+    [self.debugPanelWC hidePanel];
+    [[NSUserDefaults standardUserDefaults] setBool:NO forKey:DEFAULTS_DEBUG_PANEL_VISIBLE];
+    [self updateDebugPanelMenuItem];
+}
+
+- (void)debugPanelVisibilityChanged:(NSNotification *)notification {
+    BOOL visible = self.debugPanelWC.window.visible;
+    [[NSUserDefaults standardUserDefaults] setBool:visible forKey:DEFAULTS_DEBUG_PANEL_VISIBLE];
+    [self updateDebugPanelMenuItem];
+}
+
+- (void)updateDebugPanelMenuItem {
+    BOOL visible = self.debugPanelWC.window.visible;
+    self.debugPanelMenuItem.title = visible ? @"Hide Debug Panel" : @"Show Debug Panel";
+    self.debugPanelMenuItem.state = visible ? NSControlStateValueOn : NSControlStateValueOff;
 }
 
 - (void)displayStatusTick:(NSTimer *)timer {

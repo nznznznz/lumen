@@ -18,5 +18,7 @@
 - (float)brightnessForDisplay:(LumenDisplay *)display error:(NSError **)error;
 - (BOOL)setBrightness:(float)brightness forDisplay:(LumenDisplay *)display error:(NSError **)error;
 - (NSArray<NSDictionary<NSString *, id> *> *)displayDebugStatuses;
+- (NSDictionary<NSString *, id> *)debugSnapshot;
+- (NSString *)debugSnapshotText;
 
 @end

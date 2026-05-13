@@ -19,6 +19,7 @@
 		F851E2CE1D4DACEE0016CC9C /* Lumen.iconset in Resources */ = {isa = PBXBuildFile; fileRef = F851E2CD1D4DACEE0016CC9C /* Lumen.iconset */; };
 		F8833AE41D419803006FD2B0 /* Model.m in Sources */ = {isa = PBXBuildFile; fileRef = F8833AE31D419803006FD2B0 /* Model.m */; };
 		F8A10C012E01A00100D15A1A /* LumenDisplay.m in Sources */ = {isa = PBXBuildFile; fileRef = F8A10C002E01A00100D15A1A /* LumenDisplay.m */; };
+		F8A10C042E01A9F200D15A1A /* DebugPanelWindowController.m in Sources */ = {isa = PBXBuildFile; fileRef = F8A10C032E01A9F200D15A1A /* DebugPanelWindowController.m */; };
 		FE5E172A21A9AA9600C3193A /* IgnoreListController.m in Sources */ = {isa = PBXBuildFile; fileRef = FE5E172921A9AA9600C3193A /* IgnoreListController.m */; };
 		FE621B841FA495BB001DCE64 /* IgnoreListWindowController.m in Sources */ = {isa = PBXBuildFile; fileRef = FE621B821FA495BB001DCE64 /* IgnoreListWindowController.m */; };
 		FE621B851FA495BB001DCE64 /* IgnoreListWindowController.xib in Resources */ = {isa = PBXBuildFile; fileRef = FE621B831FA495BB001DCE64 /* IgnoreListWindowController.xib */; };
@@ -47,6 +48,8 @@
 		F8833AE31D419803006FD2B0 /* Model.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = Model.m; sourceTree = "<group>"; };
 		F8A10BFF2E01A00100D15A1A /* LumenDisplay.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = LumenDisplay.h; sourceTree = "<group>"; };
 		F8A10C002E01A00100D15A1A /* LumenDisplay.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = LumenDisplay.m; sourceTree = "<group>"; };
+		F8A10C022E01A9F200D15A1A /* DebugPanelWindowController.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = DebugPanelWindowController.h; sourceTree = "<group>"; };
+		F8A10C032E01A9F200D15A1A /* DebugPanelWindowController.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = DebugPanelWindowController.m; sourceTree = "<group>"; };
 		FE5E172821A9AA9600C3193A /* IgnoreListController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = IgnoreListController.h; sourceTree = "<group>"; };
 		FE5E172921A9AA9600C3193A /* IgnoreListController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = IgnoreListController.m; sourceTree = "<group>"; };
 		FE621B811FA495BB001DCE64 /* IgnoreListWindowController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = IgnoreListWindowController.h; sourceTree = "<group>"; };
@@ -92,6 +95,8 @@
 				F83E30F61AD8252D0098C5CC /* BrightnessController.m */,
 				F8A10BFF2E01A00100D15A1A /* LumenDisplay.h */,
 				F8A10C002E01A00100D15A1A /* LumenDisplay.m */,
+				F8A10C022E01A9F200D15A1A /* DebugPanelWindowController.h */,
+				F8A10C032E01A9F200D15A1A /* DebugPanelWindowController.m */,
 				F8833AE21D419803006FD2B0 /* Model.h */,
 				F8833AE31D419803006FD2B0 /* Model.m */,
 				F80722841E6BD17F000C3ECE /* NSArray+Functional.h */,
@@ -203,6 +208,7 @@
 				F802B9E91AD81FB700FCFD65 /* AppDelegate.m in Sources */,
 				F8833AE41D419803006FD2B0 /* Model.m in Sources */,
 				F8A10C012E01A00100D15A1A /* LumenDisplay.m in Sources */,
+				F8A10C042E01A9F200D15A1A /* DebugPanelWindowController.m in Sources */,
 				FE5E172A21A9AA9600C3193A /* IgnoreListController.m in Sources */,
 				FE621B841FA495BB001DCE64 /* IgnoreListWindowController.m in Sources */,
 			);

@@ -12,5 +12,8 @@
 - (void)observeOutput:(float)output forInput:(float)input displayKey:(NSString *)displayKey;
 - (float)predictFromInput:(float)input displayKey:(NSString *)displayKey;
 - (BOOL)hasLearnedDataForDisplayKey:(NSString *)displayKey;
+- (NSUInteger)debugSampleCountForDisplayKey:(NSString *)displayKey;
+- (NSString *)debugLearnedPointsSummaryForDisplayKey:(NSString *)displayKey;
+- (NSString *)debugRangeSummaryForDisplayKey:(NSString *)displayKey;
 
 @end

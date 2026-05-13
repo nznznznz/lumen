@@ -18,6 +18,8 @@
 #define DEFAULTS_DISPLAY_CALIBRATION_POINTS (@"displayCalibrationPoints")
 #define DEFAULTS_CALIBRATION_POINTS_MIGRATED (@"calibrationPointsMigratedToPerDisplay")
 #define DEFAULTS_IGNORE_LIST (@"ignoreList")
+#define DEFAULTS_DEBUG_PANEL_FRAME (@"debugPanelFrame")
+#define DEFAULTS_DEBUG_PANEL_VISIBLE (@"debugPanelVisible")
 
 #define NOTIFICATION_IGNORE_LIST_CHANGED (@"notification.ignoreListChanged")
 

@@ -91,9 +91,8 @@
         // because that is the old behavior's target and least surprising upgrade path.
         self.pointsByDisplayKey[displayKey] = [[self copyPoints:self.legacySeedPoints] mutableCopy];
         [defaults setBool:YES forKey:DEFAULTS_CALIBRATION_POINTS_MIGRATED];
-        NSLog(@"Migrated %lu legacy calibration points to display key %@",
-              (unsigned long)self.legacySeedPoints.count,
-              displayKey);
+        NSLog(@"Migrated %lu legacy calibration points to a per-display model",
+              (unsigned long)self.legacySeedPoints.count);
         [self synchronizeDefaults];
         return;
     }
@@ -116,6 +115,49 @@
 
 - (BOOL)hasLearnedDataForDisplayKey:(NSString *)displayKey {
     return [self pointsForDisplayKey:displayKey].count > 0;
+}
+
+- (NSUInteger)debugSampleCountForDisplayKey:(NSString *)displayKey {
+    return [self pointsForDisplayKey:displayKey].count;
+}
+
+- (NSString *)debugLearnedPointsSummaryForDisplayKey:(NSString *)displayKey {
+    NSArray<XYPoint *> *points = [self pointsForDisplayKey:displayKey];
+    if (points.count == 0) {
+        return @"no data";
+    }
+
+    NSMutableArray<NSString *> *summaries = [NSMutableArray new];
+    NSUInteger limit = MIN((NSUInteger)3, points.count);
+    for (NSUInteger i = 0; i < limit; i++) {
+        XYPoint *point = points[i];
+        [summaries addObject:[NSString stringWithFormat:@"L*=%.1f -> %.3f", point.x, point.y]];
+    }
+    if (points.count > limit) {
+        [summaries addObject:@"..."];
+    }
+    return [summaries componentsJoinedByString:@", "];
+}
+
+- (NSString *)debugRangeSummaryForDisplayKey:(NSString *)displayKey {
+    NSArray<XYPoint *> *points = [self pointsForDisplayKey:displayKey];
+    if (points.count == 0) {
+        return @"no data";
+    }
+
+    float minInput = FLT_MAX, maxInput = -FLT_MAX;
+    float minOutput = FLT_MAX, maxOutput = -FLT_MAX;
+    for (XYPoint *point in points) {
+        minInput = MIN(minInput, point.x);
+        maxInput = MAX(maxInput, point.x);
+        minOutput = MIN(minOutput, point.y);
+        maxOutput = MAX(maxOutput, point.y);
+    }
+    return [NSString stringWithFormat:@"L*=%.1f-%.1f, brightness=%.3f-%.3f",
+            minInput,
+            maxInput,
+            minOutput,
+            maxOutput];
 }
 
 - (void)observeOutput:(float)output forInput:(float)input points:(NSMutableArray<XYPoint *> *)points {
