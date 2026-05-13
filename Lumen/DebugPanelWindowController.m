@@ -18,6 +18,7 @@ NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPane
 @property (nonatomic, strong) NSArray<NSDictionary<NSString *, id> *> *displaySnapshots;
 @property (nonatomic, strong) NSArray<NSDictionary<NSString *, id> *> *eventSnapshots;
 @property (nonatomic, copy) NSString *selectedDisplayKey;
+@property (nonatomic, strong) NSArray<NSString *> *metricLabels;
 @property (nonatomic, assign) NSUInteger lastRenderedSnapshotVersion;
 
 @end
@@ -49,6 +50,27 @@ NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPane
         self.brightnessController = brightnessController;
         self.displaySnapshots = @[];
         self.eventSnapshots = @[];
+        self.metricLabels = @[@"Role",
+                              @"Lightness",
+                              @"Brightness",
+                              @"Target",
+                              @"Backend",
+                              @"Backend State",
+                              @"Action",
+                              @"Reason",
+                              @"Model",
+                              @"Training State",
+                              @"Last Learn",
+                              @"DDC Failures",
+                              @"DDC Command",
+                              @"DDC Rate Limit",
+                              @"DDC Clamp",
+                              @"DDC Degraded",
+                              @"Last Read Error",
+                              @"Last Write Error",
+                              @"Control Loop",
+                              @"Snapshot",
+                              @"Dropped Samples"];
         self.lastRenderedSnapshotVersion = NSUIntegerMax;
         panel.delegate = self;
         [self buildUI];
@@ -96,21 +118,12 @@ NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPane
     self.displayTable.dataSource = self;
     self.displayTable.usesAlternatingRowBackgroundColors = YES;
     self.displayTable.columnAutoresizingStyle = NSTableViewNoColumnAutoresizing;
-    self.displayTable.rowHeight = 30;
+    self.displayTable.rowHeight = 44;
     self.displayTable.headerView = [[NSTableHeaderView alloc] initWithFrame:NSZeroRect];
-    [self addColumn:@"display" title:@"Display" width:180];
-    [self addColumn:@"role" title:@"Role" width:105];
-    [self addColumn:@"lightness" title:@"Lightness" width:80];
-    [self addColumn:@"brightness" title:@"Brightness" width:85];
-    [self addColumn:@"target" title:@"Target" width:70];
-    [self addColumn:@"backend" title:@"Backend" width:95];
-    [self addColumn:@"action" title:@"Action" width:140];
-    [self addColumn:@"actionReason" title:@"Reason" width:170];
-    [self addColumn:@"model" title:@"Model" width:105];
-    [self addColumn:@"lastLearn" title:@"Last Learn" width:135];
+    [self addColumn:@"metric" title:@"Metric" width:180];
     tableScrollView.documentView = self.displayTable;
     [root addArrangedSubview:tableScrollView];
-    [tableScrollView.heightAnchor constraintEqualToConstant:150].active = YES;
+    [tableScrollView.heightAnchor constraintEqualToConstant:250].active = YES;
 
     NSSplitView *splitView = [[NSSplitView alloc] initWithFrame:NSZeroRect];
     splitView.vertical = NO;
@@ -190,24 +203,49 @@ NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPane
     if (!self.selectedDisplayKey && self.displaySnapshots.count > 0) {
         self.selectedDisplayKey = self.displaySnapshots[0][@"key"];
     }
+    [self rebuildDisplayColumnsIfNeeded];
     [self.displayTable reloadData];
-    [self updateSelection];
     [self updateDetailText];
     [self updateEventText];
     [self.brightnessController recordDebugPanelRenderDuration:[NSDate timeIntervalSinceReferenceDate] - renderStartedAt];
 }
 
-- (void)updateSelection {
-    NSInteger selectedIndex = -1;
-    for (NSUInteger i = 0; i < self.displaySnapshots.count; i++) {
-        if ([self.displaySnapshots[i][@"key"] isEqualToString:self.selectedDisplayKey]) {
-            selectedIndex = (NSInteger)i;
-            break;
+- (void)rebuildDisplayColumnsIfNeeded {
+    NSUInteger expectedCount = self.displaySnapshots.count + 1;
+    if (self.displayTable.tableColumns.count == expectedCount) {
+        BOOL unchanged = YES;
+        for (NSUInteger i = 0; i < self.displaySnapshots.count; i++) {
+            NSTableColumn *column = self.displayTable.tableColumns[i + 1];
+            NSString *expectedIdentifier = [NSString stringWithFormat:@"display-%lu", (unsigned long)i];
+            NSString *expectedTitle = [self displayColumnTitle:self.displaySnapshots[i]];
+            if (![column.identifier isEqualToString:expectedIdentifier] || ![column.title isEqualToString:expectedTitle]) {
+                unchanged = NO;
+                break;
+            }
+        }
+        if (unchanged) {
+            return;
         }
     }
-    if (selectedIndex >= 0 && self.displayTable.selectedRow != selectedIndex) {
-        [self.displayTable selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)selectedIndex] byExtendingSelection:NO];
+
+    while (self.displayTable.tableColumns.count > 1) {
+        [self.displayTable removeTableColumn:self.displayTable.tableColumns.lastObject];
     }
+
+    for (NSUInteger i = 0; i < self.displaySnapshots.count; i++) {
+        [self addColumn:[NSString stringWithFormat:@"display-%lu", (unsigned long)i]
+                  title:[self displayColumnTitle:self.displaySnapshots[i]]
+                  width:260];
+    }
+}
+
+- (NSString *)displayColumnTitle:(NSDictionary *)display {
+    NSString *name = [self stringValue:display[@"display"]];
+    NSString *debugKey = [self stringValue:display[@"debugKey"]];
+    if (debugKey.length > 0 && ![debugKey isEqualToString:@"-"]) {
+        return [NSString stringWithFormat:@"%@ [%@]", name, debugKey];
+    }
+    return name;
 }
 
 - (void)updateDetailText {
@@ -362,7 +400,7 @@ NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPane
 }
 
 - (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
-    return (NSInteger)self.displaySnapshots.count;
+    return (NSInteger)self.metricLabels.count;
 }
 
 - (NSView *)tableView:(NSTableView *)tableView
@@ -382,29 +420,117 @@ NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPane
         field.maximumNumberOfLines = 2;
     }
 
-    NSDictionary *display = self.displaySnapshots[(NSUInteger)row];
     NSString *identifier = tableColumn.identifier;
-    field.font = [NSFont systemFontOfSize:11];
-    if ([identifier isEqualToString:@"lightness"] || [identifier isEqualToString:@"brightness"] || [identifier isEqualToString:@"target"]) {
-        if ([identifier isEqualToString:@"brightness"] &&
-            (![display[@"canReadBrightness"] boolValue] ||
-             ![display[@"brightness"] isKindOfClass:[NSNumber class]] ||
-             [display[@"brightness"] floatValue] < 0 ||
-             isnan([display[@"brightness"] floatValue]))) {
-            field.stringValue = @"unreadable";
-        } else {
-            field.stringValue = [self formattedNumber:display[identifier] digits:3];
-        }
+    if ([identifier isEqualToString:@"metric"]) {
+        field.font = [NSFont boldSystemFontOfSize:11];
+        field.stringValue = self.metricLabels[(NSUInteger)row];
     } else {
-        field.stringValue = [self stringValue:display[identifier]];
+        field.font = [NSFont systemFontOfSize:11];
+        NSUInteger displayIndex = [self displayIndexForColumnIdentifier:identifier];
+        if (displayIndex == NSNotFound || displayIndex >= self.displaySnapshots.count) {
+            field.stringValue = @"-";
+        } else {
+            NSDictionary *display = self.displaySnapshots[displayIndex];
+            field.stringValue = [self valueForMetric:self.metricLabels[(NSUInteger)row] display:display];
+        }
     }
     return field;
 }
 
+- (NSUInteger)displayIndexForColumnIdentifier:(NSString *)identifier {
+    if (![identifier hasPrefix:@"display-"]) {
+        return NSNotFound;
+    }
+    NSInteger index = [[identifier substringFromIndex:@"display-".length] integerValue];
+    return index >= 0 ? (NSUInteger)index : NSNotFound;
+}
+
+- (NSString *)valueForMetric:(NSString *)metric display:(NSDictionary *)display {
+    if ([metric isEqualToString:@"Role"]) {
+        return [self stringValue:display[@"role"]];
+    }
+    if ([metric isEqualToString:@"Lightness"]) {
+        return [self formattedNumber:display[@"lightness"] digits:3];
+    }
+    if ([metric isEqualToString:@"Brightness"]) {
+        if (![display[@"canReadBrightness"] boolValue] ||
+            ![display[@"brightness"] isKindOfClass:[NSNumber class]] ||
+            [display[@"brightness"] floatValue] < 0 ||
+            isnan([display[@"brightness"] floatValue])) {
+            return @"unreadable";
+        }
+        return [self formattedNumber:display[@"brightness"] digits:3];
+    }
+    if ([metric isEqualToString:@"Target"]) {
+        return [self formattedNumber:display[@"target"] digits:3];
+    }
+    if ([metric isEqualToString:@"Backend"]) {
+        return [self stringValue:display[@"backend"]];
+    }
+    if ([metric isEqualToString:@"Backend State"]) {
+        return [self stringValue:display[@"backendState"]];
+    }
+    if ([metric isEqualToString:@"Action"]) {
+        return [self stringValue:display[@"action"]];
+    }
+    if ([metric isEqualToString:@"Reason"]) {
+        return [self stringValue:display[@"actionReason"]];
+    }
+    if ([metric isEqualToString:@"Model"]) {
+        return [self stringValue:display[@"model"]];
+    }
+    if ([metric isEqualToString:@"Training State"]) {
+        return [self stringValue:display[@"trainingDecision"]];
+    }
+    if ([metric isEqualToString:@"Last Learn"]) {
+        return [self stringValue:display[@"lastLearn"]];
+    }
+    if ([metric isEqualToString:@"DDC Failures"]) {
+        NSString *readFailures = [self stringValue:display[@"ddcConsecutiveReadFailures"]];
+        NSString *writeFailures = [self stringValue:display[@"ddcConsecutiveWriteFailures"]];
+        return [NSString stringWithFormat:@"read %@, write %@", readFailures, writeFailures];
+    }
+    if ([metric isEqualToString:@"DDC Command"]) {
+        return [NSString stringWithFormat:@"in flight: %@",
+                [self yesNo:display[@"ddcCommandInFlight"]]];
+    }
+    if ([metric isEqualToString:@"DDC Rate Limit"]) {
+        return [NSString stringWithFormat:@"limited: %@, skipped %@",
+                [self yesNo:display[@"ddcRateLimited"]],
+                [self stringValue:display[@"ddcSkippedRateLimitCount"]]];
+    }
+    if ([metric isEqualToString:@"DDC Clamp"]) {
+        if (![display[@"ddcClampApplied"] boolValue]) {
+            return @"no";
+        }
+        return [NSString stringWithFormat:@"yes, applied %@",
+                [self formattedNumber:display[@"ddcLastAppliedBrightness"] digits:3]];
+    }
+    if ([metric isEqualToString:@"DDC Degraded"]) {
+        return [self dashIfEmpty:display[@"ddcDegradedReason"]];
+    }
+    if ([metric isEqualToString:@"Last Read Error"]) {
+        return [self dashIfEmpty:display[@"lastReadError"]];
+    }
+    if ([metric isEqualToString:@"Last Write Error"]) {
+        return [self dashIfEmpty:display[@"lastWriteError"]];
+    }
+    if ([metric isEqualToString:@"Control Loop"]) {
+        return [self formattedSeconds:display[@"lastControlLoopDuration"]];
+    }
+    if ([metric isEqualToString:@"Snapshot"]) {
+        return [self formattedSeconds:display[@"snapshotGenerationDuration"]];
+    }
+    if ([metric isEqualToString:@"Dropped Samples"]) {
+        return [self stringValue:display[@"droppedSampleCount"]];
+    }
+    return @"-";
+}
+
 - (void)tableViewSelectionDidChange:(NSNotification *)notification {
-    NSInteger row = self.displayTable.selectedRow;
-    if (row >= 0 && row < (NSInteger)self.displaySnapshots.count) {
-        self.selectedDisplayKey = self.displaySnapshots[(NSUInteger)row][@"key"];
+    NSInteger column = self.displayTable.clickedColumn;
+    if (column > 0 && column - 1 < (NSInteger)self.displaySnapshots.count) {
+        self.selectedDisplayKey = self.displaySnapshots[(NSUInteger)(column - 1)][@"key"];
         [self updateDetailText];
     }
 }
