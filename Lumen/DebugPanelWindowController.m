@@ -5,32 +5,63 @@
 #import "BrightnessController.h"
 #import "Constants.h"
 #import <math.h>
+#import <os/log.h>
 
 NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPanelVisibilityChangedNotification";
 
-@interface DebugPanelWindowController () <NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate>
+static os_log_t LumenDebugPanelLog(void) {
+    static os_log_t log;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        log = os_log_create("com.anishathalye.lumen", "debug-panel");
+    });
+    return log;
+}
+
+static const CGFloat LumenDebugMetricColumnWidth = 170.0;
+static const CGFloat LumenDebugDisplayColumnWidth = 280.0;
+static const CGFloat LumenDebugRowHeight = 22.0;
+static const CGFloat LumenDebugGridPadding = 12.0;
+static const CGFloat LumenDebugGridColumnSpacing = 10.0;
+static const CGFloat LumenDebugGridRowSpacing = 2.0;
+
+@interface LumenDebugGridDocumentView : NSView
+@end
+
+@implementation LumenDebugGridDocumentView
+
+- (BOOL)isFlipped {
+    return YES;
+}
+
+@end
+
+@interface DebugPanelWindowController () <NSWindowDelegate>
 
 @property (nonatomic, weak) BrightnessController *brightnessController;
-@property (nonatomic, strong) NSTableView *displayTable;
-@property (nonatomic, strong) NSTextView *detailTextView;
-@property (nonatomic, strong) NSTextView *eventTextView;
+@property (nonatomic, strong) NSScrollView *gridScrollView;
+@property (nonatomic, strong) NSGridView *gridView;
+@property (nonatomic, strong) NSButton *debugCopyButton;
 @property (nonatomic, strong) NSTimer *refreshTimer;
-@property (nonatomic, strong) NSArray<NSDictionary<NSString *, id> *> *displaySnapshots;
-@property (nonatomic, strong) NSArray<NSDictionary<NSString *, id> *> *eventSnapshots;
-@property (nonatomic, copy) NSString *selectedDisplayKey;
-@property (nonatomic, strong) NSArray<NSString *> *metricLabels;
-@property (nonatomic, assign) NSUInteger lastRenderedSnapshotVersion;
+@property (nonatomic, strong) NSArray<NSDictionary<NSString *, NSString *> *> *metrics;
+@property (nonatomic, copy) NSString *lastRenderedSnapshotToken;
+@property (nonatomic, strong) NSArray<NSString *> *renderedDisplayKeys;
+@property (nonatomic, strong) NSArray<NSString *> *renderedMetricKeys;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSTextField *> *valueFieldsByCellKey;
+@property (nonatomic, assign) BOOL loggedMissingSnapshot;
 
 @end
 
 @implementation DebugPanelWindowController
 
 - (instancetype)initWithBrightnessController:(BrightnessController *)brightnessController {
-    NSRect frame = NSMakeRect(200, 200, 920, 520);
+    NSRect frame = NSMakeRect(200, 200, 1000, 520);
     NSString *savedFrame = [[NSUserDefaults standardUserDefaults] stringForKey:DEFAULTS_DEBUG_PANEL_FRAME];
     if (savedFrame.length > 0) {
         frame = NSRectFromString(savedFrame);
     }
+    frame.size.width = MAX(frame.size.width, 1000);
+    frame.size.height = MAX(frame.size.height, 520);
 
     NSPanel *panel = [[NSPanel alloc] initWithContentRect:frame
                                                 styleMask:(NSWindowStyleMaskTitled |
@@ -43,43 +74,84 @@ NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPane
     panel.level = NSFloatingWindowLevel;
     panel.hidesOnDeactivate = NO;
     panel.releasedWhenClosed = NO;
-    panel.minSize = NSMakeSize(700, 380);
+    panel.minSize = NSMakeSize(720, 360);
 
     self = [super initWithWindow:panel];
     if (self) {
         self.brightnessController = brightnessController;
-        self.displaySnapshots = @[];
-        self.eventSnapshots = @[];
-        self.metricLabels = @[@"Role",
-                              @"Lightness",
-                              @"Brightness",
-                              @"Target",
-                              @"Backend",
-                              @"Backend State",
-                              @"Action",
-                              @"Reason",
-                              @"Model",
-                              @"Training State",
-                              @"Last Learn",
-                              @"DDC Failures",
-                              @"DDC Command",
-                              @"DDC Rate Limit",
-                              @"DDC Clamp",
-                              @"DDC Degraded",
-                              @"Last Read Error",
-                              @"Last Write Error",
-                              @"Control Loop",
-                              @"Snapshot",
-                              @"Dropped Samples"];
-        self.lastRenderedSnapshotVersion = NSUIntegerMax;
+        self.metrics = [self defaultMetrics];
         panel.delegate = self;
         [self buildUI];
     }
     return self;
 }
 
+- (NSArray<NSDictionary<NSString *, NSString *> *> *)defaultMetrics {
+    return @[
+        @{@"title": @"Role", @"key": @"role"},
+        @{@"title": @"Backend", @"key": @"backend"},
+        @{@"title": @"Backend State", @"key": @"backendState"},
+        @{@"title": @"Capture", @"key": @"capture"},
+        @{@"title": @"Lightness L*", @"key": @"lightnessLStar"},
+        @{@"title": @"Lightness", @"key": @"lightness"},
+        @{@"title": @"Brightness", @"key": @"brightness"},
+        @{@"title": @"Target", @"key": @"target"},
+        @{@"title": @"Action", @"key": @"action"},
+        @{@"title": @"Reason", @"key": @"actionReason"},
+        @{@"title": @"Can read brightness", @"key": @"canReadBrightness"},
+        @{@"title": @"Can set brightness", @"key": @"canSetBrightness"},
+        @{@"title": @"Controllable", @"key": @"controllable"},
+        @{@"title": @"Model", @"key": @"model"},
+        @{@"title": @"Samples", @"key": @"modelSampleCount"},
+        @{@"title": @"Learned Points", @"key": @"learnedPoints"},
+        @{@"title": @"Last Learn", @"key": @"lastLearn"},
+        @{@"title": @"Training", @"key": @"trainingDecision"},
+        @{@"title": @"Last Read Error", @"key": @"lastReadError"},
+        @{@"title": @"Last Write Error", @"key": @"lastWriteError"},
+        @{@"title": @"Read Failures", @"key": @"readFailures"},
+        @{@"title": @"Write Failures", @"key": @"writeFailures"},
+        @{@"title": @"Command In Flight", @"key": @"commandInFlight"},
+        @{@"title": @"Last DDC Read Duration", @"key": @"lastDDCReadDuration"},
+        @{@"title": @"Last DDC Write Duration", @"key": @"lastDDCWriteDuration"},
+        @{@"title": @"Display ID", @"key": @"displayID"},
+        @{@"title": @"Debug Key", @"key": @"debugKey"},
+    ];
+}
+
+- (void)buildUI {
+    NSView *contentView = self.window.contentView;
+
+    self.gridScrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    self.gridScrollView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.gridScrollView.hasVerticalScroller = YES;
+    self.gridScrollView.hasHorizontalScroller = YES;
+    self.gridScrollView.autohidesScrollers = YES;
+    self.gridScrollView.borderType = NSBezelBorder;
+    [contentView addSubview:self.gridScrollView];
+
+    self.debugCopyButton = [NSButton buttonWithTitle:@"Copy Debug State"
+                                              target:self
+                                              action:@selector(copyDebugState:)];
+    self.debugCopyButton.bezelStyle = NSBezelStyleRounded;
+    self.debugCopyButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [contentView addSubview:self.debugCopyButton];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.gridScrollView.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:10],
+        [self.gridScrollView.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor constant:-10],
+        [self.gridScrollView.topAnchor constraintEqualToAnchor:contentView.topAnchor constant:10],
+        [self.gridScrollView.bottomAnchor constraintEqualToAnchor:self.debugCopyButton.topAnchor constant:-8],
+
+        [self.debugCopyButton.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor constant:10],
+        [self.debugCopyButton.bottomAnchor constraintEqualToAnchor:contentView.bottomAnchor constant:-10],
+    ]];
+
+    [self renderPlaceholder:@"No debug snapshot yet"];
+}
+
 - (void)showPanel {
-    [self refresh:nil];
+    self.lastRenderedSnapshotToken = nil;
+    [self refreshFromLatestSnapshot];
     [self.window makeKeyAndOrderFront:nil];
     [self startRefreshTimer];
     [self notifyVisibilityChanged];
@@ -92,91 +164,13 @@ NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPane
     [self notifyVisibilityChanged];
 }
 
-- (void)buildUI {
-    NSView *contentView = self.window.contentView;
-
-    NSStackView *root = [[NSStackView alloc] initWithFrame:contentView.bounds];
-    root.orientation = NSUserInterfaceLayoutOrientationVertical;
-    root.spacing = 8;
-    root.edgeInsets = NSEdgeInsetsMake(10, 10, 10, 10);
-    root.translatesAutoresizingMaskIntoConstraints = NO;
-    [contentView addSubview:root];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [root.leadingAnchor constraintEqualToAnchor:contentView.leadingAnchor],
-        [root.trailingAnchor constraintEqualToAnchor:contentView.trailingAnchor],
-        [root.topAnchor constraintEqualToAnchor:contentView.topAnchor],
-        [root.bottomAnchor constraintEqualToAnchor:contentView.bottomAnchor],
-    ]];
-
-    NSScrollView *tableScrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
-    tableScrollView.hasVerticalScroller = YES;
-    tableScrollView.hasHorizontalScroller = YES;
-    tableScrollView.translatesAutoresizingMaskIntoConstraints = NO;
-    self.displayTable = [[NSTableView alloc] initWithFrame:NSZeroRect];
-    self.displayTable.delegate = self;
-    self.displayTable.dataSource = self;
-    self.displayTable.usesAlternatingRowBackgroundColors = YES;
-    self.displayTable.columnAutoresizingStyle = NSTableViewNoColumnAutoresizing;
-    self.displayTable.rowHeight = 44;
-    self.displayTable.headerView = [[NSTableHeaderView alloc] initWithFrame:NSZeroRect];
-    [self addColumn:@"metric" title:@"Metric" width:180];
-    tableScrollView.documentView = self.displayTable;
-    [root addArrangedSubview:tableScrollView];
-    [tableScrollView.heightAnchor constraintEqualToConstant:250].active = YES;
-
-    NSSplitView *splitView = [[NSSplitView alloc] initWithFrame:NSZeroRect];
-    splitView.vertical = NO;
-    splitView.dividerStyle = NSSplitViewDividerStyleThin;
-    splitView.translatesAutoresizingMaskIntoConstraints = NO;
-
-    NSTextView *detailTextView = nil;
-    NSTextView *eventTextView = nil;
-    NSScrollView *detailScrollView = [self scrollViewForTextView:&detailTextView];
-    NSScrollView *eventScrollView = [self scrollViewForTextView:&eventTextView];
-    self.detailTextView = detailTextView;
-    self.eventTextView = eventTextView;
-    [splitView addSubview:detailScrollView];
-    [splitView addSubview:eventScrollView];
-    [root addArrangedSubview:splitView];
-
-    NSButton *copyButton = [NSButton buttonWithTitle:@"Copy Debug State"
-                                             target:self
-                                             action:@selector(copyDebugState:)];
-    copyButton.bezelStyle = NSBezelStyleRounded;
-    [root addArrangedSubview:copyButton];
-}
-
-- (NSScrollView *)scrollViewForTextView:(NSTextView **)textViewPointer {
-    NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
-    scrollView.hasVerticalScroller = YES;
-    scrollView.hasHorizontalScroller = YES;
-    NSTextView *textView = [[NSTextView alloc] initWithFrame:NSZeroRect];
-    textView.editable = NO;
-    textView.selectable = YES;
-    textView.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-    textView.textContainerInset = NSMakeSize(6, 6);
-    scrollView.documentView = textView;
-    *textViewPointer = textView;
-    return scrollView;
-}
-
-- (void)addColumn:(NSString *)identifier title:(NSString *)title width:(CGFloat)width {
-    NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:identifier];
-    column.title = title;
-    column.width = width;
-    column.minWidth = 55;
-    column.resizingMask = NSTableColumnUserResizingMask;
-    [self.displayTable addTableColumn:column];
-}
-
 - (void)startRefreshTimer {
     if (self.refreshTimer) {
         return;
     }
     self.refreshTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
                                                          target:self
-                                                       selector:@selector(refresh:)
+                                                       selector:@selector(refreshTimerFired:)
                                                        userInfo:nil
                                                         repeats:YES];
 }
@@ -186,201 +180,409 @@ NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPane
     self.refreshTimer = nil;
 }
 
-- (void)refresh:(NSTimer *)timer {
-    NSTimeInterval renderStartedAt = [NSDate timeIntervalSinceReferenceDate];
+- (void)refreshTimerFired:(NSTimer *)timer {
+    [self refreshFromLatestSnapshot];
+}
+
+- (void)refreshFromLatestSnapshot {
     NSDictionary *snapshot = [self.brightnessController debugSnapshot];
-    NSUInteger version = [snapshot[@"version"] unsignedIntegerValue];
-    if (version == self.lastRenderedSnapshotVersion) {
+    NSString *token = [self tokenForSnapshot:snapshot];
+    if ([token isEqualToString:self.lastRenderedSnapshotToken]) {
         return;
     }
-    self.lastRenderedSnapshotVersion = version;
+    self.lastRenderedSnapshotToken = token;
+
+    if (snapshot.count == 0) {
+        if (!self.loggedMissingSnapshot) {
+            self.loggedMissingSnapshot = YES;
+            os_log_debug(LumenDebugPanelLog(), "No debug snapshot yet");
+        }
+        [self renderPlaceholder:@"No debug snapshot yet"];
+        return;
+    }
 
     NSArray *displays = snapshot[@"displays"];
-    NSArray *events = snapshot[@"events"];
-    self.displaySnapshots = [displays isKindOfClass:[NSArray class]] ? displays : @[];
-    self.eventSnapshots = [events isKindOfClass:[NSArray class]] ? events : @[];
-
-    if (!self.selectedDisplayKey && self.displaySnapshots.count > 0) {
-        self.selectedDisplayKey = self.displaySnapshots[0][@"key"];
-    }
-    [self rebuildDisplayColumnsIfNeeded];
-    [self.displayTable reloadData];
-    [self updateDetailText];
-    [self updateEventText];
-    [self.brightnessController recordDebugPanelRenderDuration:[NSDate timeIntervalSinceReferenceDate] - renderStartedAt];
-}
-
-- (void)rebuildDisplayColumnsIfNeeded {
-    NSUInteger expectedCount = self.displaySnapshots.count + 1;
-    if (self.displayTable.tableColumns.count == expectedCount) {
-        BOOL unchanged = YES;
-        for (NSUInteger i = 0; i < self.displaySnapshots.count; i++) {
-            NSTableColumn *column = self.displayTable.tableColumns[i + 1];
-            NSString *expectedIdentifier = [NSString stringWithFormat:@"display-%lu", (unsigned long)i];
-            NSString *expectedTitle = [self displayColumnTitle:self.displaySnapshots[i]];
-            if (![column.identifier isEqualToString:expectedIdentifier] || ![column.title isEqualToString:expectedTitle]) {
-                unchanged = NO;
-                break;
-            }
-        }
-        if (unchanged) {
-            return;
-        }
-    }
-
-    while (self.displayTable.tableColumns.count > 1) {
-        [self.displayTable removeTableColumn:self.displayTable.tableColumns.lastObject];
-    }
-
-    for (NSUInteger i = 0; i < self.displaySnapshots.count; i++) {
-        [self addColumn:[NSString stringWithFormat:@"display-%lu", (unsigned long)i]
-                  title:[self displayColumnTitle:self.displaySnapshots[i]]
-                  width:260];
-    }
-}
-
-- (NSString *)displayColumnTitle:(NSDictionary *)display {
-    NSString *name = [self stringValue:display[@"display"]];
-    NSString *debugKey = [self stringValue:display[@"debugKey"]];
-    if (debugKey.length > 0 && ![debugKey isEqualToString:@"-"]) {
-        return [NSString stringWithFormat:@"%@ [%@]", name, debugKey];
-    }
-    return name;
-}
-
-- (void)updateDetailText {
-    NSDictionary *display = [self selectedDisplaySnapshot];
-    if (!display) {
-        self.detailTextView.string = @"No display selected";
+    if (![displays isKindOfClass:[NSArray class]] || displays.count == 0) {
+        os_log_debug(LumenDebugPanelLog(), "Debug snapshot contains no displays");
+        [self renderPlaceholder:@"No displays in debug snapshot"];
         return;
     }
 
-    NSArray<NSString *> *lines = @[
-        [self detailLine:@"stable display key" value:display[@"key"]],
-        [self detailLine:@"debug key" value:display[@"debugKey"]],
-        [self detailLine:@"CGDirectDisplayID" value:display[@"displayID"]],
-        [self detailLine:@"bounds/frame" value:display[@"bounds"]],
-        [self detailLine:@"scale factor" value:[self formattedNumber:display[@"scaleFactor"] digits:2]],
-        [self detailLine:@"capture status" value:display[@"captureStatus"]],
-        [self detailLine:@"brightness backend" value:display[@"backend"]],
-        [self detailLine:@"backend state" value:display[@"backendState"]],
-        [self detailLine:@"can read brightness" value:[self yesNo:display[@"canReadBrightness"]]],
-        [self detailLine:@"can set brightness" value:[self yesNo:display[@"canSetBrightness"]]],
-        [self detailLine:@"DDC command in flight" value:[self yesNo:display[@"ddcCommandInFlight"]]],
-        [self detailLine:@"DDC rate limited" value:[self yesNo:display[@"ddcRateLimited"]]],
-        [self detailLine:@"DDC skipped in flight" value:display[@"ddcSkippedInFlightCount"]],
-        [self detailLine:@"DDC skipped rate limit" value:display[@"ddcSkippedRateLimitCount"]],
-        [self detailLine:@"DDC read failures" value:display[@"ddcConsecutiveReadFailures"]],
-        [self detailLine:@"DDC write failures" value:display[@"ddcConsecutiveWriteFailures"]],
-        [self detailLine:@"DDC last read attempt" value:[self formattedTime:display[@"ddcLastReadAttemptTimestamp"]]],
-        [self detailLine:@"DDC last read success" value:[self formattedTime:display[@"ddcLastReadSuccessTimestamp"]]],
-        [self detailLine:@"DDC last read duration" value:[self formattedSeconds:display[@"ddcLastReadDuration"]]],
-        [self detailLine:@"DDC last read error" value:[self dashIfEmpty:display[@"ddcLastReadError"]]],
-        [self detailLine:@"DDC last write attempt" value:[self formattedTime:display[@"ddcLastWriteAttemptTimestamp"]]],
-        [self detailLine:@"DDC last write success" value:[self formattedTime:display[@"ddcLastWriteSuccessTimestamp"]]],
-        [self detailLine:@"DDC last write duration" value:[self formattedSeconds:display[@"ddcLastWriteDuration"]]],
-        [self detailLine:@"DDC last write error" value:[self dashIfEmpty:display[@"ddcLastWriteError"]]],
-        [self detailLine:@"DDC degraded reason" value:[self dashIfEmpty:display[@"ddcDegradedReason"]]],
-        [self detailLine:@"DDC clamp applied" value:[self yesNo:display[@"ddcClampApplied"]]],
-        [self detailLine:@"DDC applied brightness" value:[self formattedNumber:display[@"ddcLastAppliedBrightness"] digits:3]],
-        [self detailLine:@"last read brightness" value:[self formattedNumber:display[@"lastReadBrightness"] digits:3]],
-        [self detailLine:@"last written brightness" value:[self formattedNumber:display[@"lastWrittenBrightness"] digits:3]],
-        [self detailLine:@"last write timestamp" value:[self formattedTime:display[@"lastWriteTimestamp"]]],
-        [self detailLine:@"last write error" value:[self dashIfEmpty:display[@"lastWriteError"]]],
-        [self detailLine:@"current lightness" value:[self formattedNumber:display[@"lightness"] digits:3]],
-        [self detailLine:@"current lightness L*" value:[self formattedNumber:display[@"lightnessLStar"] digits:2]],
-        [self detailLine:@"current predicted brightness" value:[self formattedNumber:display[@"target"] digits:3]],
-        [self detailLine:@"model sample count" value:display[@"modelSampleCount"]],
-        [self detailLine:@"prediction mode" value:@"nearest learned point"],
-        [self detailLine:@"learned range" value:display[@"modelRange"]],
-        [self detailLine:@"nearest learned points" value:display[@"learnedPoints"]],
-        [self detailLine:@"last manual override timestamp" value:[self formattedTime:display[@"lastManualOverrideTimestamp"]]],
-        [self detailLine:@"last manual override delta" value:[self formattedNumber:display[@"manualDelta"] digits:3]],
-        [self detailLine:@"last training decision" value:display[@"trainingDecision"]],
-        [self detailLine:@"last action reason" value:display[@"actionReason"]],
-        [self detailLine:@"last decision timestamp" value:[self formattedTime:display[@"actionTimestamp"]]],
-        [self detailLine:@"last control-loop duration" value:[self formattedSeconds:display[@"lastControlLoopDuration"]]],
-        [self detailLine:@"snapshot generation duration" value:[self formattedSeconds:display[@"snapshotGenerationDuration"]]],
-        [self detailLine:@"debug panel render duration" value:[self formattedSeconds:display[@"debugPanelLastRenderDuration"]]],
-        [self detailLine:@"dropped/coalesced samples" value:display[@"droppedSampleCount"]],
-        [self detailLine:@"last read error" value:[self dashIfEmpty:display[@"lastReadError"]]],
-        [self detailLine:@"has valid brightness baseline" value:[self yesNo:display[@"hasValidBrightnessBaseline"]]],
-        [self detailLine:@"brightness baseline" value:[self formattedNumber:display[@"brightnessBaseline"] digits:3]],
-        [self detailLine:@"brightness baseline timestamp" value:[self formattedTime:display[@"brightnessBaselineTimestamp"]]],
-    ];
-    self.detailTextView.string = [lines componentsJoinedByString:@"\n"];
+    [self renderGridWithDisplays:displays];
+    os_log_debug(LumenDebugPanelLog(),
+                 "Debug panel refreshed displayCount=%{public}lu metricCount=%{public}lu",
+                 (unsigned long)displays.count,
+                 (unsigned long)self.metrics.count);
 }
 
-- (void)updateEventText {
-    NSMutableArray<NSString *> *lines = [NSMutableArray new];
-    for (NSDictionary *event in [self.eventSnapshots reverseObjectEnumerator]) {
-        NSString *display = event[@"display"] ?: @"";
-        NSString *debugKey = event[@"debugKey"] ?: @"";
-        NSString *prefix = display.length > 0 ? [NSString stringWithFormat:@"%@ [%@]", display, debugKey] : @"global";
-        NSString *reason = event[@"reason"];
-        NSString *decisionSuffix = reason.length > 0 ? [NSString stringWithFormat:@" reason=%@", reason] : @"";
-        [lines addObject:[NSString stringWithFormat:@"%@  %@  %@%@",
-                          event[@"time"] ?: @"",
-                          prefix,
-                          event[@"event"] ?: @"",
-                          decisionSuffix]];
+- (NSString *)tokenForSnapshot:(NSDictionary *)snapshot {
+    if (![snapshot isKindOfClass:[NSDictionary class]] || snapshot.count == 0) {
+        return @"empty";
     }
-    self.eventTextView.string = lines.count > 0 ? [lines componentsJoinedByString:@"\n"] : @"No events yet";
+
+    id version = snapshot[@"version"];
+    if (version) {
+        return [NSString stringWithFormat:@"version:%@", version];
+    }
+
+    id generatedAt = snapshot[@"generatedAt"];
+    NSArray *displays = [snapshot[@"displays"] isKindOfClass:[NSArray class]] ? snapshot[@"displays"] : @[];
+    return [NSString stringWithFormat:@"generated:%@ displays:%lu hash:%lu",
+            generatedAt ?: @"none",
+            (unsigned long)displays.count,
+            (unsigned long)snapshot.hash];
 }
 
-- (NSDictionary *)selectedDisplaySnapshot {
-    for (NSDictionary *display in self.displaySnapshots) {
-        if ([display[@"key"] isEqualToString:self.selectedDisplayKey]) {
-            return display;
+- (void)renderPlaceholder:(NSString *)message {
+    NSTextField *label = [self makeValueLabel:message];
+    label.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
+    label.textColor = [NSColor secondaryLabelColor];
+    label.frame = NSMakeRect(LumenDebugGridPadding, LumenDebugGridPadding, 360, 24);
+
+    LumenDebugGridDocumentView *container = [[LumenDebugGridDocumentView alloc] initWithFrame:NSMakeRect(0, 0, 420, 48)];
+    [container addSubview:label];
+    self.gridScrollView.documentView = container;
+    self.gridView = nil;
+    self.renderedDisplayKeys = nil;
+    self.renderedMetricKeys = nil;
+    self.valueFieldsByCellKey = nil;
+    [self resizeDocumentViewForGridContentSize:NSMakeSize(420, 48) scrollToTop:YES];
+}
+
+- (void)renderGridWithDisplays:(NSArray *)displays {
+    NSArray<NSString *> *displayKeys = [self displayKeysForDisplays:displays];
+    NSArray<NSString *> *metricKeys = [self metricKeys];
+
+    if (self.gridView &&
+        [displayKeys isEqualToArray:self.renderedDisplayKeys] &&
+        [metricKeys isEqualToArray:self.renderedMetricKeys]) {
+        [self updateGridValuesWithDisplays:displays displayKeys:displayKeys];
+        return;
+    }
+
+    [self rebuildGridWithDisplays:displays displayKeys:displayKeys metricKeys:metricKeys];
+}
+
+- (void)rebuildGridWithDisplays:(NSArray *)displays
+                    displayKeys:(NSArray<NSString *> *)displayKeys
+                      metricKeys:(NSArray<NSString *> *)metricKeys {
+    NSMutableArray<NSArray<NSView *> *> *rows = [NSMutableArray new];
+    NSMutableDictionary<NSString *, NSTextField *> *valueFieldsByCellKey = [NSMutableDictionary new];
+
+    NSMutableArray<NSView *> *headerRow = [NSMutableArray new];
+    [headerRow addObject:[self makeHeaderLabel:@"Metric"]];
+    for (NSUInteger displayIndex = 0; displayIndex < displays.count; displayIndex++) {
+        NSDictionary *display = displays[displayIndex];
+        NSTextField *header = [self makeHeaderLabel:[self displayNameForDisplay:display]];
+        NSString *debugKey = [self stringOrDash:display[@"debugKey"]];
+        if (![debugKey isEqualToString:@"—"]) {
+            header.toolTip = debugKey;
+        }
+        [headerRow addObject:header];
+    }
+    [rows addObject:headerRow];
+
+    for (NSDictionary<NSString *, NSString *> *metric in self.metrics) {
+        NSString *metricKey = metric[@"key"];
+        NSMutableArray<NSView *> *row = [NSMutableArray new];
+        [row addObject:[self makeMetricLabel:metric[@"title"]]];
+        for (NSUInteger displayIndex = 0; displayIndex < displays.count; displayIndex++) {
+            NSDictionary *display = displays[displayIndex];
+            NSString *displayKey = displayKeys[displayIndex];
+            NSString *value = [self valueForMetric:metricKey displaySnapshot:display];
+            NSTextField *field = [self makeValueLabel:value];
+            [self updateLabel:field withValue:value];
+            valueFieldsByCellKey[[self cellKeyForMetricKey:metricKey displayKey:displayKey]] = field;
+            [row addObject:field];
+        }
+        [rows addObject:row];
+    }
+
+    NSGridView *gridView = [NSGridView gridViewWithViews:rows];
+    gridView.translatesAutoresizingMaskIntoConstraints = NO;
+    gridView.rowSpacing = LumenDebugGridRowSpacing;
+    gridView.columnSpacing = LumenDebugGridColumnSpacing;
+    gridView.xPlacement = NSGridCellPlacementLeading;
+    gridView.yPlacement = NSGridCellPlacementCenter;
+
+    for (NSInteger column = 0; column < gridView.numberOfColumns; column++) {
+        NSGridColumn *gridColumn = [gridView columnAtIndex:column];
+        gridColumn.xPlacement = NSGridCellPlacementLeading;
+        gridColumn.width = column == 0 ? LumenDebugMetricColumnWidth : LumenDebugDisplayColumnWidth;
+    }
+    for (NSInteger row = 0; row < gridView.numberOfRows; row++) {
+        NSGridRow *gridRow = [gridView rowAtIndex:row];
+        gridRow.yPlacement = NSGridCellPlacementCenter;
+        gridRow.height = LumenDebugRowHeight;
+    }
+
+    LumenDebugGridDocumentView *documentView = [[LumenDebugGridDocumentView alloc] initWithFrame:NSMakeRect(0, 0, 1, 1)];
+    [documentView addSubview:gridView];
+    [NSLayoutConstraint activateConstraints:@[
+        [gridView.leadingAnchor constraintEqualToAnchor:documentView.leadingAnchor constant:LumenDebugGridPadding],
+        [gridView.topAnchor constraintEqualToAnchor:documentView.topAnchor constant:LumenDebugGridPadding],
+    ]];
+
+    self.gridView = gridView;
+    self.renderedDisplayKeys = displayKeys;
+    self.renderedMetricKeys = metricKeys;
+    self.valueFieldsByCellKey = valueFieldsByCellKey;
+    self.gridScrollView.documentView = documentView;
+    [self resizeDocumentViewForCurrentGrid];
+}
+
+- (void)updateGridValuesWithDisplays:(NSArray *)displays displayKeys:(NSArray<NSString *> *)displayKeys {
+    [NSAnimationContext beginGrouping];
+    NSAnimationContext.currentContext.duration = 0.0;
+    NSAnimationContext.currentContext.allowsImplicitAnimation = NO;
+
+    for (NSUInteger displayIndex = 0; displayIndex < displays.count; displayIndex++) {
+        NSDictionary *display = displays[displayIndex];
+        NSString *displayKey = displayKeys[displayIndex];
+        for (NSDictionary<NSString *, NSString *> *metric in self.metrics) {
+            NSString *metricKey = metric[@"key"];
+            NSTextField *field = self.valueFieldsByCellKey[[self cellKeyForMetricKey:metricKey displayKey:displayKey]];
+            if (!field) {
+                continue;
+            }
+            [self updateLabel:field withValue:[self valueForMetric:metricKey displaySnapshot:display]];
         }
     }
-    return self.displaySnapshots.firstObject;
+
+    [NSAnimationContext endGrouping];
 }
 
-- (NSString *)detailLine:(NSString *)key value:(id)value {
-    return [NSString stringWithFormat:@"%-32@: %@", key, [self stringValue:value]];
+- (void)updateLabel:(NSTextField *)label withValue:(NSString *)value {
+    NSString *text = value.length > 0 ? value : @"—";
+    if (![label.stringValue isEqualToString:text]) {
+        label.stringValue = text;
+    }
+    label.toolTip = (text.length > 0 && ![text isEqualToString:@"—"]) ? text : nil;
 }
 
-- (NSString *)stringValue:(id)value {
+- (void)resizeDocumentViewForCurrentGrid {
+    if (!self.gridView) {
+        return;
+    }
+
+    CGFloat width = (LumenDebugGridPadding * 2.0) + LumenDebugMetricColumnWidth;
+    width += self.renderedDisplayKeys.count * LumenDebugDisplayColumnWidth;
+    width += self.renderedDisplayKeys.count * LumenDebugGridColumnSpacing;
+
+    CGFloat height = (LumenDebugGridPadding * 2.0);
+    height += (self.renderedMetricKeys.count + 1) * LumenDebugRowHeight;
+    height += self.renderedMetricKeys.count * LumenDebugGridRowSpacing;
+    [self resizeDocumentViewForGridContentSize:NSMakeSize(width, height) scrollToTop:YES];
+}
+
+- (void)resizeDocumentViewForGridContentSize:(NSSize)contentSize scrollToTop:(BOOL)scrollToTop {
+    NSView *documentView = self.gridScrollView.documentView;
+    if (!documentView) {
+        return;
+    }
+
+    NSSize clipSize = self.gridScrollView.contentView.bounds.size;
+    CGFloat width = MAX(contentSize.width, clipSize.width);
+    CGFloat height = MAX(contentSize.height, clipSize.height);
+    documentView.frame = NSMakeRect(0, 0, width, height);
+    if (scrollToTop) {
+        [self.gridScrollView.contentView scrollToPoint:NSZeroPoint];
+        [self.gridScrollView reflectScrolledClipView:self.gridScrollView.contentView];
+    }
+}
+
+- (NSArray<NSString *> *)displayKeysForDisplays:(NSArray *)displays {
+    NSMutableArray<NSString *> *keys = [NSMutableArray arrayWithCapacity:displays.count];
+    for (NSDictionary *display in displays) {
+        [keys addObject:[self structureKeyForDisplay:display]];
+    }
+    return keys;
+}
+
+- (NSArray<NSString *> *)metricKeys {
+    NSMutableArray<NSString *> *keys = [NSMutableArray arrayWithCapacity:self.metrics.count];
+    for (NSDictionary<NSString *, NSString *> *metric in self.metrics) {
+        [keys addObject:metric[@"key"] ?: @""];
+    }
+    return keys;
+}
+
+- (NSString *)structureKeyForDisplay:(NSDictionary *)display {
+    NSString *identity = [self nonEmptyString:display[@"debugKey"]];
+    if (!identity) {
+        identity = [self nonEmptyString:display[@"displayID"]];
+    }
+    if (!identity) {
+        identity = [self displayNameForDisplay:display];
+    }
+    return [NSString stringWithFormat:@"%@|%@", identity ?: @"display", [self displayNameForDisplay:display]];
+}
+
+- (NSString *)cellKeyForMetricKey:(NSString *)metricKey displayKey:(NSString *)displayKey {
+    return [NSString stringWithFormat:@"%@\n%@", metricKey ?: @"", displayKey ?: @""];
+}
+
+- (NSString *)displayNameForDisplay:(NSDictionary *)display {
+    NSString *name = [self nonEmptyString:display[@"name"]];
+    if (!name) {
+        name = [self nonEmptyString:display[@"display"]];
+    }
+    if (!name) {
+        id displayID = display[@"displayID"];
+        if (displayID) {
+            name = [NSString stringWithFormat:@"Display %@", displayID];
+        }
+    }
+    if (!name) {
+        name = [self nonEmptyString:display[@"debugKey"]];
+    }
+    return name ?: @"Display";
+}
+
+- (NSTextField *)makeHeaderLabel:(NSString *)text {
+    NSTextField *label = [self makeBaseLabel:text];
+    label.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
+    return label;
+}
+
+- (NSTextField *)makeMetricLabel:(NSString *)text {
+    NSTextField *label = [self makeBaseLabel:text];
+    label.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+    return label;
+}
+
+- (NSTextField *)makeValueLabel:(NSString *)text {
+    NSTextField *label = [self makeBaseLabel:text];
+    label.font = [NSFont systemFontOfSize:11 weight:NSFontWeightRegular];
+    return label;
+}
+
+- (NSTextField *)makeBaseLabel:(NSString *)text {
+    NSTextField *label = [NSTextField labelWithString:text ?: @"—"];
+    label.textColor = [NSColor labelColor];
+    label.lineBreakMode = NSLineBreakByTruncatingTail;
+    label.usesSingleLineMode = YES;
+    label.alignment = NSTextAlignmentLeft;
+    label.maximumNumberOfLines = 1;
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    [label.widthAnchor constraintGreaterThanOrEqualToConstant:20].active = YES;
+    return label;
+}
+
+- (NSString *)valueForMetric:(NSString *)metric displaySnapshot:(NSDictionary *)display {
+    @try {
+        if ([metric isEqualToString:@"capture"]) {
+            NSString *status = [self nonEmptyString:display[@"captureStatus"]];
+            if (status) {
+                return status;
+            }
+            return [self yesNoOrDash:display[@"captureActive"]];
+        }
+        if ([metric isEqualToString:@"lightnessLStar"]) {
+            return [self formattedNumber:display[@"lightnessLStar"] digits:1];
+        }
+        if ([metric isEqualToString:@"lightness"]) {
+            return [self formattedNumber:display[@"lightness"] digits:3];
+        }
+        if ([metric isEqualToString:@"brightness"]) {
+            if (![display[@"canReadBrightness"] boolValue]) {
+                return @"unreadable";
+            }
+            return [self formattedNumber:display[@"brightness"] digits:3];
+        }
+        if ([metric isEqualToString:@"target"]) {
+            return [self formattedNumber:display[@"target"] digits:3];
+        }
+        if ([metric isEqualToString:@"canReadBrightness"] ||
+            [metric isEqualToString:@"canSetBrightness"] ||
+            [metric isEqualToString:@"controllable"]) {
+            return [self yesNoOrDash:display[metric]];
+        }
+        if ([metric isEqualToString:@"readFailures"]) {
+            return [self firstPresentStringFromDisplay:display keys:@[@"consecutiveReadFailures", @"ddcConsecutiveReadFailures"]];
+        }
+        if ([metric isEqualToString:@"writeFailures"]) {
+            return [self firstPresentStringFromDisplay:display keys:@[@"consecutiveWriteFailures", @"ddcConsecutiveWriteFailures"]];
+        }
+        if ([metric isEqualToString:@"commandInFlight"]) {
+            id value = [self firstPresentValueFromDisplay:display keys:@[@"commandInFlight", @"ddcCommandInFlight"]];
+            return [self yesNoOrDash:value];
+        }
+        if ([metric isEqualToString:@"lastDDCReadDuration"]) {
+            id value = [self firstPresentValueFromDisplay:display keys:@[@"lastDDCReadDuration", @"ddcLastReadDuration"]];
+            return [self formattedSeconds:value];
+        }
+        if ([metric isEqualToString:@"lastDDCWriteDuration"]) {
+            id value = [self firstPresentValueFromDisplay:display keys:@[@"lastDDCWriteDuration", @"ddcLastWriteDuration"]];
+            return [self formattedSeconds:value];
+        }
+        if ([metric isEqualToString:@"lastReadError"] || [metric isEqualToString:@"lastWriteError"]) {
+            return [self stringOrDash:display[metric]];
+        }
+        return [self stringOrDash:display[metric]];
+    } @catch (NSException *exception) {
+        os_log_debug(LumenDebugPanelLog(),
+                     "Debug grid missing/invalid field metric=%{public}@ exception=%{public}@",
+                     metric,
+                     exception.reason ?: exception.name);
+        return @"—";
+    }
+}
+
+- (id)firstPresentValueFromDisplay:(NSDictionary *)display keys:(NSArray<NSString *> *)keys {
+    for (NSString *key in keys) {
+        id value = display[key];
+        if (value && value != [NSNull null]) {
+            return value;
+        }
+    }
+    return nil;
+}
+
+- (NSString *)firstPresentStringFromDisplay:(NSDictionary *)display keys:(NSArray<NSString *> *)keys {
+    return [self stringOrDash:[self firstPresentValueFromDisplay:display keys:keys]];
+}
+
+- (NSString *)yesNoOrDash:(id)value {
     if (!value || value == [NSNull null]) {
-        return @"-";
+        return @"—";
     }
-    if ([value isKindOfClass:[NSString class]]) {
-        return ((NSString *)value).length > 0 ? value : @"-";
-    }
-    return [value description];
-}
-
-- (NSString *)dashIfEmpty:(id)value {
-    NSString *string = [self stringValue:value];
-    return string.length > 0 ? string : @"-";
-}
-
-- (NSString *)yesNo:(id)value {
     return [value boolValue] ? @"yes" : @"no";
 }
 
 - (NSString *)formattedNumber:(id)value digits:(NSUInteger)digits {
-    if (![value isKindOfClass:[NSNumber class]] || isnan([value floatValue]) || [value floatValue] < 0) {
-        return @"-";
+    if (![value isKindOfClass:[NSNumber class]]) {
+        return @"—";
     }
-    return [NSString stringWithFormat:[NSString stringWithFormat:@"%%.%luf", (unsigned long)digits], [value floatValue]];
-}
-
-- (NSString *)formattedTime:(id)value {
-    if (![value isKindOfClass:[NSNumber class]] || [value doubleValue] <= 0) {
-        return @"-";
+    double number = [value doubleValue];
+    if (!isfinite(number) || number < 0) {
+        return @"—";
     }
-    NSDateFormatter *formatter = [NSDateFormatter new];
-    formatter.dateFormat = @"HH:mm:ss";
-    return [formatter stringFromDate:[NSDate dateWithTimeIntervalSinceReferenceDate:[value doubleValue]]];
+    return [NSString stringWithFormat:[NSString stringWithFormat:@"%%.%luf", (unsigned long)digits], number];
 }
 
 - (NSString *)formattedSeconds:(id)value {
-    if (![value isKindOfClass:[NSNumber class]] || [value doubleValue] <= 0) {
-        return @"-";
+    NSString *number = [self formattedNumber:value digits:3];
+    return [number isEqualToString:@"—"] ? number : [number stringByAppendingString:@"s"];
+}
+
+- (NSString *)stringOrDash:(id)value {
+    NSString *string = [self nonEmptyString:value];
+    return string ?: @"—";
+}
+
+- (NSString *)nonEmptyString:(id)value {
+    if (!value || value == [NSNull null]) {
+        return nil;
     }
-    return [NSString stringWithFormat:@"%.3fs", [value doubleValue]];
+    if ([value isKindOfClass:[NSNumber class]]) {
+        double number = [value doubleValue];
+        if (!isfinite(number)) {
+            return nil;
+        }
+    }
+    NSString *string = [value description];
+    return string.length > 0 ? string : nil;
 }
 
 - (void)copyDebugState:(id)sender {
@@ -399,142 +601,6 @@ NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPane
     });
 }
 
-- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
-    return (NSInteger)self.metricLabels.count;
-}
-
-- (NSView *)tableView:(NSTableView *)tableView
-   viewForTableColumn:(NSTableColumn *)tableColumn
-                  row:(NSInteger)row {
-    NSTextField *field = [tableView makeViewWithIdentifier:tableColumn.identifier owner:self];
-    if (!field) {
-        field = [[NSTextField alloc] initWithFrame:NSZeroRect];
-        field.identifier = tableColumn.identifier;
-        field.bezeled = NO;
-        field.drawsBackground = NO;
-        field.editable = NO;
-        field.selectable = YES;
-        field.font = [NSFont systemFontOfSize:11];
-        field.lineBreakMode = NSLineBreakByWordWrapping;
-        field.usesSingleLineMode = NO;
-        field.maximumNumberOfLines = 2;
-    }
-
-    NSString *identifier = tableColumn.identifier;
-    if ([identifier isEqualToString:@"metric"]) {
-        field.font = [NSFont boldSystemFontOfSize:11];
-        field.stringValue = self.metricLabels[(NSUInteger)row];
-    } else {
-        field.font = [NSFont systemFontOfSize:11];
-        NSUInteger displayIndex = [self displayIndexForColumnIdentifier:identifier];
-        if (displayIndex == NSNotFound || displayIndex >= self.displaySnapshots.count) {
-            field.stringValue = @"-";
-        } else {
-            NSDictionary *display = self.displaySnapshots[displayIndex];
-            field.stringValue = [self valueForMetric:self.metricLabels[(NSUInteger)row] display:display];
-        }
-    }
-    return field;
-}
-
-- (NSUInteger)displayIndexForColumnIdentifier:(NSString *)identifier {
-    if (![identifier hasPrefix:@"display-"]) {
-        return NSNotFound;
-    }
-    NSInteger index = [[identifier substringFromIndex:@"display-".length] integerValue];
-    return index >= 0 ? (NSUInteger)index : NSNotFound;
-}
-
-- (NSString *)valueForMetric:(NSString *)metric display:(NSDictionary *)display {
-    if ([metric isEqualToString:@"Role"]) {
-        return [self stringValue:display[@"role"]];
-    }
-    if ([metric isEqualToString:@"Lightness"]) {
-        return [self formattedNumber:display[@"lightness"] digits:3];
-    }
-    if ([metric isEqualToString:@"Brightness"]) {
-        if (![display[@"canReadBrightness"] boolValue] ||
-            ![display[@"brightness"] isKindOfClass:[NSNumber class]] ||
-            [display[@"brightness"] floatValue] < 0 ||
-            isnan([display[@"brightness"] floatValue])) {
-            return @"unreadable";
-        }
-        return [self formattedNumber:display[@"brightness"] digits:3];
-    }
-    if ([metric isEqualToString:@"Target"]) {
-        return [self formattedNumber:display[@"target"] digits:3];
-    }
-    if ([metric isEqualToString:@"Backend"]) {
-        return [self stringValue:display[@"backend"]];
-    }
-    if ([metric isEqualToString:@"Backend State"]) {
-        return [self stringValue:display[@"backendState"]];
-    }
-    if ([metric isEqualToString:@"Action"]) {
-        return [self stringValue:display[@"action"]];
-    }
-    if ([metric isEqualToString:@"Reason"]) {
-        return [self stringValue:display[@"actionReason"]];
-    }
-    if ([metric isEqualToString:@"Model"]) {
-        return [self stringValue:display[@"model"]];
-    }
-    if ([metric isEqualToString:@"Training State"]) {
-        return [self stringValue:display[@"trainingDecision"]];
-    }
-    if ([metric isEqualToString:@"Last Learn"]) {
-        return [self stringValue:display[@"lastLearn"]];
-    }
-    if ([metric isEqualToString:@"DDC Failures"]) {
-        NSString *readFailures = [self stringValue:display[@"ddcConsecutiveReadFailures"]];
-        NSString *writeFailures = [self stringValue:display[@"ddcConsecutiveWriteFailures"]];
-        return [NSString stringWithFormat:@"read %@, write %@", readFailures, writeFailures];
-    }
-    if ([metric isEqualToString:@"DDC Command"]) {
-        return [NSString stringWithFormat:@"in flight: %@",
-                [self yesNo:display[@"ddcCommandInFlight"]]];
-    }
-    if ([metric isEqualToString:@"DDC Rate Limit"]) {
-        return [NSString stringWithFormat:@"limited: %@, skipped %@",
-                [self yesNo:display[@"ddcRateLimited"]],
-                [self stringValue:display[@"ddcSkippedRateLimitCount"]]];
-    }
-    if ([metric isEqualToString:@"DDC Clamp"]) {
-        if (![display[@"ddcClampApplied"] boolValue]) {
-            return @"no";
-        }
-        return [NSString stringWithFormat:@"yes, applied %@",
-                [self formattedNumber:display[@"ddcLastAppliedBrightness"] digits:3]];
-    }
-    if ([metric isEqualToString:@"DDC Degraded"]) {
-        return [self dashIfEmpty:display[@"ddcDegradedReason"]];
-    }
-    if ([metric isEqualToString:@"Last Read Error"]) {
-        return [self dashIfEmpty:display[@"lastReadError"]];
-    }
-    if ([metric isEqualToString:@"Last Write Error"]) {
-        return [self dashIfEmpty:display[@"lastWriteError"]];
-    }
-    if ([metric isEqualToString:@"Control Loop"]) {
-        return [self formattedSeconds:display[@"lastControlLoopDuration"]];
-    }
-    if ([metric isEqualToString:@"Snapshot"]) {
-        return [self formattedSeconds:display[@"snapshotGenerationDuration"]];
-    }
-    if ([metric isEqualToString:@"Dropped Samples"]) {
-        return [self stringValue:display[@"droppedSampleCount"]];
-    }
-    return @"-";
-}
-
-- (void)tableViewSelectionDidChange:(NSNotification *)notification {
-    NSInteger column = self.displayTable.clickedColumn;
-    if (column > 0 && column - 1 < (NSInteger)self.displaySnapshots.count) {
-        self.selectedDisplayKey = self.displaySnapshots[(NSUInteger)(column - 1)][@"key"];
-        [self updateDetailText];
-    }
-}
-
 - (BOOL)windowShouldClose:(id)sender {
     [self hidePanel];
     return NO;
@@ -545,7 +611,25 @@ NSString * const LumenDebugPanelVisibilityChangedNotification = @"LumenDebugPane
 }
 
 - (void)windowDidResize:(NSNotification *)notification {
+    if (self.gridView) {
+        [self resizeDocumentViewForCurrentGridPreservingScroll];
+    }
     [self saveFrame];
+}
+
+- (void)resizeDocumentViewForCurrentGridPreservingScroll {
+    if (!self.gridView) {
+        return;
+    }
+
+    CGFloat width = (LumenDebugGridPadding * 2.0) + LumenDebugMetricColumnWidth;
+    width += self.renderedDisplayKeys.count * LumenDebugDisplayColumnWidth;
+    width += self.renderedDisplayKeys.count * LumenDebugGridColumnSpacing;
+
+    CGFloat height = (LumenDebugGridPadding * 2.0);
+    height += (self.renderedMetricKeys.count + 1) * LumenDebugRowHeight;
+    height += self.renderedMetricKeys.count * LumenDebugGridRowSpacing;
+    [self resizeDocumentViewForGridContentSize:NSMakeSize(width, height) scrollToTop:NO];
 }
 
 - (void)saveFrame {
