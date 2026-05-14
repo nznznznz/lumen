@@ -24,6 +24,7 @@ static const CGFloat LumenDebugRowHeight = 22.0;
 static const CGFloat LumenDebugGridPadding = 12.0;
 static const CGFloat LumenDebugGridColumnSpacing = 10.0;
 static const CGFloat LumenDebugGridRowSpacing = 2.0;
+static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
 
 @interface LumenDebugGridDocumentView : NSView
 @end
@@ -93,6 +94,13 @@ static const CGFloat LumenDebugGridRowSpacing = 2.0;
         @{@"title": @"Control Method", @"key": @"controlMethod"},
         @{@"title": @"Backend State", @"key": @"backendState"},
         @{@"title": @"Capture", @"key": @"capture"},
+        @{@"title": @"Capture Rate", @"key": @"captureRate"},
+        @{@"title": @"Accepted Sample Rate", @"key": @"acceptedSampleRate"},
+        @{@"title": @"Dropped Samples", @"key": @"droppedSampleCount"},
+        @{@"title": @"Last Lightness Compute Duration", @"key": @"lastLightnessComputeDuration"},
+        @{@"title": @"Last Control Loop Duration", @"key": @"lastControlLoopDuration"},
+        @{@"title": @"Debug Refresh Rate", @"key": @"debugRefreshRate"},
+        @{@"title": @"Last Debug Render Duration", @"key": @"debugPanelLastRenderDuration"},
         @{@"title": @"Lightness L*", @"key": @"lightnessLStar"},
         @{@"title": @"Lightness", @"key": @"lightness"},
         @{@"title": @"Brightness", @"key": @"brightness"},
@@ -103,6 +111,8 @@ static const CGFloat LumenDebugGridRowSpacing = 2.0;
         @{@"title": @"Overlay Alpha", @"key": @"overlayAlpha"},
         @{@"title": @"Overlay Desired Alpha", @"key": @"overlayDesiredAlpha"},
         @{@"title": @"Overlay Applied Alpha", @"key": @"overlayAppliedAlpha"},
+        @{@"title": @"Overlay Updates Skipped", @"key": @"overlayUpdatesSkipped"},
+        @{@"title": @"Last Overlay Update Duration", @"key": @"lastOverlayUpdateDuration"},
         @{@"title": @"Temporarily Hidden", @"key": @"overlayTemporarilyHidden"},
         @{@"title": @"Hidden Reason", @"key": @"overlayHiddenReason"},
         @{@"title": @"Hidden Until", @"key": @"overlayHiddenUntil"},
@@ -189,7 +199,7 @@ static const CGFloat LumenDebugGridRowSpacing = 2.0;
     if (self.refreshTimer) {
         return;
     }
-    self.refreshTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
+    self.refreshTimer = [NSTimer scheduledTimerWithTimeInterval:LumenDebugPanelRefreshInterval
                                                          target:self
                                                        selector:@selector(refreshTimerFired:)
                                                        userInfo:nil
@@ -212,6 +222,7 @@ static const CGFloat LumenDebugGridRowSpacing = 2.0;
         return;
     }
     self.lastRenderedSnapshotToken = token;
+    NSTimeInterval renderStartedAt = [NSDate timeIntervalSinceReferenceDate];
 
     if (snapshot.count == 0) {
         if (!self.loggedMissingSnapshot) {
@@ -219,6 +230,7 @@ static const CGFloat LumenDebugGridRowSpacing = 2.0;
             os_log_debug(LumenDebugPanelLog(), "No debug snapshot yet");
         }
         [self renderPlaceholder:@"No debug snapshot yet"];
+        [self.brightnessController recordDebugPanelRenderDuration:[NSDate timeIntervalSinceReferenceDate] - renderStartedAt];
         return;
     }
 
@@ -226,10 +238,12 @@ static const CGFloat LumenDebugGridRowSpacing = 2.0;
     if (![displays isKindOfClass:[NSArray class]] || displays.count == 0) {
         os_log_debug(LumenDebugPanelLog(), "Debug snapshot contains no displays");
         [self renderPlaceholder:@"No displays in debug snapshot"];
+        [self.brightnessController recordDebugPanelRenderDuration:[NSDate timeIntervalSinceReferenceDate] - renderStartedAt];
         return;
     }
 
     [self renderGridWithDisplays:displays];
+    [self.brightnessController recordDebugPanelRenderDuration:[NSDate timeIntervalSinceReferenceDate] - renderStartedAt];
     os_log_debug(LumenDebugPanelLog(),
                  "Debug panel refreshed displayCount=%{public}lu metricCount=%{public}lu",
                  (unsigned long)displays.count,
@@ -499,6 +513,24 @@ static const CGFloat LumenDebugGridRowSpacing = 2.0;
             }
             return [self yesNoOrDash:display[@"captureActive"]];
         }
+        if ([metric isEqualToString:@"captureRate"] ||
+            [metric isEqualToString:@"acceptedSampleRate"] ||
+            [metric isEqualToString:@"debugRefreshRate"]) {
+            if ([metric isEqualToString:@"debugRefreshRate"]) {
+                return [self formattedRate:@(1.0 / LumenDebugPanelRefreshInterval)];
+            }
+            return [self formattedRate:display[metric]];
+        }
+        if ([metric isEqualToString:@"droppedSampleCount"] ||
+            [metric isEqualToString:@"overlayUpdatesSkipped"]) {
+            return [self formattedInteger:display[metric]];
+        }
+        if ([metric isEqualToString:@"lastLightnessComputeDuration"] ||
+            [metric isEqualToString:@"lastControlLoopDuration"] ||
+            [metric isEqualToString:@"debugPanelLastRenderDuration"] ||
+            [metric isEqualToString:@"lastOverlayUpdateDuration"]) {
+            return [self formattedSeconds:display[metric]];
+        }
         if ([metric isEqualToString:@"lightnessLStar"]) {
             return [self formattedNumber:display[@"lightnessLStar"] digits:1];
         }
@@ -615,6 +647,22 @@ static const CGFloat LumenDebugGridRowSpacing = 2.0;
 - (NSString *)formattedSeconds:(id)value {
     NSString *number = [self formattedNumber:value digits:3];
     return [number isEqualToString:@"—"] ? number : [number stringByAppendingString:@"s"];
+}
+
+- (NSString *)formattedRate:(id)value {
+    NSString *number = [self formattedNumber:value digits:2];
+    return [number isEqualToString:@"—"] ? number : [number stringByAppendingString:@"/s"];
+}
+
+- (NSString *)formattedInteger:(id)value {
+    if (![value isKindOfClass:[NSNumber class]]) {
+        return @"—";
+    }
+    double number = [value doubleValue];
+    if (!isfinite(number) || number < 0) {
+        return @"—";
+    }
+    return [NSString stringWithFormat:@"%lld", [value longLongValue]];
 }
 
 - (NSString *)stringOrDash:(id)value {

@@ -41,6 +41,14 @@ static float const LumenOverlayDefaultBrightBrightness = 0.55f;
 static float const LumenOverlayManualStep = 0.05f;
 static NSTimeInterval const LumenOverlayScreenshotHideDuration = 10.0;
 static NSString * const LumenExternalSoftwareDimmingEnabledKey = @"externalSoftwareDimmingEnabled";
+static NSTimeInterval const LumenActiveSampleInterval = 0.5;
+static NSTimeInterval const LumenIdleSampleInterval = 1.0;
+static NSTimeInterval const LumenStableSampleAfter = 4.0;
+static NSTimeInterval const LumenForceControlInterval = 3.0;
+static double const LumenLightnessDeltaThreshold = 0.5;
+static float const LumenOverlayAlphaDeltaThreshold = 0.005f;
+static NSUInteger const LumenLightnessSampleGridWidth = 80;
+static NSUInteger const LumenLightnessSampleGridHeight = 45;
 
 static os_log_t LumenDebugLog(void) {
     static os_log_t log;
@@ -107,6 +115,8 @@ static os_log_t LumenDebugLog(void) {
 @property (nonatomic, assign) NSTimeInterval hiddenUntilTimestamp;
 @property (nonatomic, copy) NSString *hiddenReason;
 @property (nonatomic, assign) NSTimeInterval lastUpdateTime;
+@property (nonatomic, assign) NSUInteger overlayUpdatesSkipped;
+@property (nonatomic, assign) NSTimeInterval lastOverlayUpdateDuration;
 @property (nonatomic, strong) NSPanel *panel;
 
 @end
@@ -211,6 +221,22 @@ static os_log_t LumenDebugLog(void) {
 @property (nonatomic, assign) NSTimeInterval lastBaselineEventTime;
 @property (nonatomic, assign) NSTimeInterval lastIgnoredManualEventTime;
 @property (nonatomic, assign) NSUInteger droppedSampleCount;
+@property (nonatomic, assign) NSUInteger captureCallbackCount;
+@property (nonatomic, assign) NSUInteger acceptedSampleCount;
+@property (nonatomic, assign) NSTimeInterval lastCaptureCallbackTimestamp;
+@property (nonatomic, assign) NSTimeInterval lastAcceptedSampleTimestamp;
+@property (nonatomic, assign) NSTimeInterval captureRateWindowStart;
+@property (nonatomic, assign) NSUInteger captureRateWindowCount;
+@property (nonatomic, assign) NSTimeInterval acceptedRateWindowStart;
+@property (nonatomic, assign) NSUInteger acceptedRateWindowCount;
+@property (nonatomic, assign) double captureRate;
+@property (nonatomic, assign) double acceptedSampleRate;
+@property (nonatomic, assign) NSTimeInterval lastLightnessComputeDuration;
+@property (nonatomic, assign) NSTimeInterval lastFullControlTime;
+@property (nonatomic, assign) NSTimeInterval lightnessStableSince;
+@property (nonatomic, copy) NSString *lastSkippedEventSignature;
+@property (nonatomic, assign) NSTimeInterval lastSkippedEventTime;
+@property (nonatomic, assign) NSUInteger skippedEventRepeatCount;
 
 @end
 
@@ -257,6 +283,22 @@ static os_log_t LumenDebugLog(void) {
         self.lastBaselineEventTime = 0;
         self.lastIgnoredManualEventTime = 0;
         self.droppedSampleCount = 0;
+        self.captureCallbackCount = 0;
+        self.acceptedSampleCount = 0;
+        self.lastCaptureCallbackTimestamp = 0;
+        self.lastAcceptedSampleTimestamp = 0;
+        self.captureRateWindowStart = 0;
+        self.captureRateWindowCount = 0;
+        self.acceptedRateWindowStart = 0;
+        self.acceptedRateWindowCount = 0;
+        self.captureRate = 0;
+        self.acceptedSampleRate = 0;
+        self.lastLightnessComputeDuration = 0;
+        self.lastFullControlTime = 0;
+        self.lightnessStableSince = 0;
+        self.lastSkippedEventSignature = @"";
+        self.lastSkippedEventTime = 0;
+        self.skippedEventRepeatCount = 0;
     }
     return self;
 }
@@ -271,6 +313,8 @@ static os_log_t LumenDebugLog(void) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, SCStream *> *streamsByDisplayKey;
 @property (nonatomic, strong) NSMutableDictionary<NSValue *, NSString *> *displayKeyByStream;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, LumenDisplayState *> *displayStatesByKey;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *lastAcceptedSampleTimeByDisplayKey;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *targetSampleIntervalByDisplayKey;
 @property (nonatomic, strong) NSMutableArray<NSDictionary<NSString *, id> *> *debugEvents;
 @property (nonatomic, strong) NSArray<id<LumenBrightnessBackend>> *brightnessBackends;
 @property (nonatomic, strong) SoftwareOverlayBrightnessBackend *softwareOverlayBackend;
@@ -304,6 +348,8 @@ static os_log_t LumenDebugLog(void) {
 - (void)processLightness:(double)lightness forDisplay:(LumenDisplay *)display;
 - (void)updateDebugSnapshot;
 - (double)computeLightnessFromSampleBuffer:(CMSampleBufferRef)sampleBuffer;
+- (void)recordCaptureCallbackForState:(LumenDisplayState *)state atTime:(NSTimeInterval)time dropped:(BOOL)dropped;
+- (void)recordAcceptedSampleForState:(LumenDisplayState *)state atTime:(NSTimeInterval)time;
 - (void)addDebugEvent:(NSString *)event display:(LumenDisplay *)display;
 - (void)addSkippedDecisionEventForDisplay:(LumenDisplay *)display
                                     state:(LumenDisplayState *)state
@@ -535,8 +581,16 @@ static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char 
         state.displayID = display.displayID;
         state.displayKey = display.stableKey ?: @"";
         state.displayName = display.displayName ?: @"";
-        state.frame = display.bounds;
         state.targetBrightness = brightness;
+        if (fabsf(state.desiredOverlayAlpha - overlayAlpha) < LumenOverlayAlphaDeltaThreshold &&
+            !state.temporarilyHiddenForScreenshot &&
+            CGRectEqualToRect(state.frame, display.bounds)) {
+            state.overlayUpdatesSkipped++;
+            state.overlayEnabled = self.enabled;
+            state.lastUpdateTime = [NSDate timeIntervalSinceReferenceDate];
+            return YES;
+        }
+        state.frame = display.bounds;
         state.desiredOverlayAlpha = overlayAlpha;
         state.overlayEnabled = self.enabled;
         state.lastUpdateTime = [NSDate timeIntervalSinceReferenceDate];
@@ -586,6 +640,8 @@ static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char 
                  @"overlayIgnoresMouseEvents": @YES,
                  @"overlayCanBecomeKey": @NO,
                  @"overlayCanBecomeMain": @NO,
+                 @"overlayUpdatesSkipped": @(state ? state.overlayUpdatesSkipped : 0),
+                 @"lastOverlayUpdateDuration": @(state ? state.lastOverlayUpdateDuration : 0),
                  @"hardwareBrightness": @"unreadable"};
     }
 }
@@ -727,6 +783,8 @@ static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char 
         state.temporarilyHiddenForScreenshot = NO;
         state.hiddenUntilTimestamp = 0;
         state.hiddenReason = @"";
+        state.overlayUpdatesSkipped = 0;
+        state.lastOverlayUpdateDuration = 0;
         self.statesByDisplayKey[display.stableKey] = state;
     }
     return state;
@@ -738,6 +796,7 @@ static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char 
     }
 
     void (^updateWindow)(void) = ^{
+        NSTimeInterval startedAt = [NSDate timeIntervalSinceReferenceDate];
         BOOL hidden = state.temporarilyHiddenForScreenshot;
         state.overlayEnabled = self.enabled;
         state.appliedOverlayAlpha = (self.enabled && !hidden && !remove) ? state.desiredOverlayAlpha : 0.0f;
@@ -790,6 +849,7 @@ static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char 
         } else {
             [state.panel orderFrontRegardless];
         }
+        state.lastOverlayUpdateDuration = [NSDate timeIntervalSinceReferenceDate] - startedAt;
     };
 
     if ([NSThread isMainThread]) {
@@ -1569,6 +1629,8 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         self.streamsByDisplayKey = [NSMutableDictionary new];
         self.displayKeyByStream = [NSMutableDictionary new];
         self.displayStatesByKey = [NSMutableDictionary new];
+        self.lastAcceptedSampleTimeByDisplayKey = [NSMutableDictionary new];
+        self.targetSampleIntervalByDisplayKey = [NSMutableDictionary new];
         self.debugEvents = [NSMutableArray new];
         self.controllerQueue = dispatch_queue_create("com.anishathalye.lumen.controller", DISPATCH_QUEUE_SERIAL);
         self.sampleQueue = dispatch_queue_create("com.anishathalye.lumen.samples", DISPATCH_QUEUE_CONCURRENT);
@@ -1769,7 +1831,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
     config.width = MAX(1, captureDisplay.width / LINEAR_SUBSAMPLE);
     config.height = MAX(1, captureDisplay.height / LINEAR_SUBSAMPLE);
-    config.minimumFrameInterval = CMTimeMake(1, FRAME_RATE);
+    config.minimumFrameInterval = CMTimeMakeWithSeconds(LumenActiveSampleInterval, 600);
     config.pixelFormat = kCVPixelFormatType_32BGRA;
     config.showsCursor = NO;
     config.capturesAudio = NO;
@@ -1849,6 +1911,10 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     [self.streamsByDisplayKey removeAllObjects];
     @synchronized (self.displayKeyByStream) {
         [self.displayKeyByStream removeAllObjects];
+    }
+    @synchronized (self.lastAcceptedSampleTimeByDisplayKey) {
+        [self.lastAcceptedSampleTimeByDisplayKey removeAllObjects];
+        [self.targetSampleIntervalByDisplayKey removeAllObjects];
     }
 }
 
@@ -1973,14 +2039,8 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                                              reason:@"debounce"];
             return;
         }
-        if (brightness == state.lastAssigned) {
+        if (state.lastAssigned >= 0 && fabsf(brightness - state.lastAssigned) <= CHANGE_NOTICE) {
             [self setAction:@"skipped: unchanged" reason:@"brightness read unavailable" display:display state:state];
-            [self addSkippedDecisionEventForDisplay:display
-                                              state:state
-                                          lightness:lightness
-                                             target:brightness
-                                  currentBrightness:-1
-                                             reason:@"unchanged"];
             return;
         }
 
@@ -2017,14 +2077,8 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         state.noticed = NO;
         state.lastTrainingDecision = @"not trained: use overlay Learn Current";
 
-        if (fabsf(brightness - state.lastAssigned) <= CHANGE_NOTICE) {
+        if (state.lastAssigned >= 0 && fabsf(brightness - state.lastAssigned) <= CHANGE_NOTICE) {
             [self setAction:@"skipped: unchanged" reason:@"overlay unchanged within tolerance" display:display state:state];
-            [self addSkippedDecisionEventForDisplay:display
-                                              state:state
-                                          lightness:lightness
-                                             target:brightness
-                                  currentBrightness:setPoint
-                                             reason:@"unchanged"];
             return;
         }
 
@@ -2162,14 +2216,8 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         return;
     }
 
-    if (brightness == state.lastAssigned) {
+    if (state.lastAssigned >= 0 && fabsf(brightness - state.lastAssigned) <= CHANGE_NOTICE) {
         [self setAction:@"skipped: unchanged" reason:@"unchanged within tolerance" display:display state:state];
-        [self addSkippedDecisionEventForDisplay:display
-                                          state:state
-                                      lightness:lightness
-                                         target:brightness
-                              currentBrightness:setPoint
-                                         reason:@"unchanged"];
         return;
     }
 
@@ -2563,7 +2611,14 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                                     @"lastControlLoopDuration": @(self.lastControlLoopDuration),
                                     @"snapshotGenerationDuration": @(self.snapshotGenerationDuration),
                                     @"debugPanelLastRenderDuration": @(self.debugPanelLastRenderDuration),
+                                    @"captureCallbackCount": @(state.captureCallbackCount),
+                                    @"acceptedSampleCount": @(state.acceptedSampleCount),
+                                    @"captureRate": @(state.captureRate),
+                                    @"acceptedSampleRate": @(state.acceptedSampleRate),
                                     @"droppedSampleCount": @(state.droppedSampleCount),
+                                    @"lastLightnessComputeDuration": @(state.lastLightnessComputeDuration),
+                                    @"lastCaptureCallbackTimestamp": @(state.lastCaptureCallbackTimestamp),
+                                    @"lastAcceptedSampleTimestamp": @(state.lastAcceptedSampleTimestamp),
                                     @"model": modelState,
                                     @"modelSampleCount": @(sampleCount),
                                     @"modelHasData": @(learned),
@@ -2636,11 +2691,33 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                                    target:(float)target
                         currentBrightness:(float)currentBrightness
                                    reason:(NSString *)reason {
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    NSString *signature = [NSString stringWithFormat:@"%@|%@|%.3f",
+                           display.stableKey ?: @"",
+                           reason ?: @"unknown",
+                           target];
+    if (state &&
+        [state.lastSkippedEventSignature isEqualToString:signature] &&
+        now - state.lastSkippedEventTime < LumenNoisyDebugEventInterval) {
+        state.skippedEventRepeatCount++;
+        return;
+    }
+
+    NSUInteger repeatCount = state ? state.skippedEventRepeatCount : 0;
+    if (state) {
+        state.lastSkippedEventSignature = signature;
+        state.lastSkippedEventTime = now;
+        state.skippedEventRepeatCount = 0;
+    }
+
     NSString *event = [NSString stringWithFormat:@"decision skipped: %@ lightness %.3f target %.3f%@",
                        reason ?: @"unknown",
                        lightness / 100.0,
                        target,
                        currentBrightness >= 0 ? [NSString stringWithFormat:@" current %.3f", currentBrightness] : @""];
+    if (repeatCount > 0) {
+        event = [event stringByAppendingFormat:@" (repeated %lu)", (unsigned long)repeatCount];
+    }
     NSMutableDictionary *entry = [@{@"timestamp": @([NSDate timeIntervalSinceReferenceDate]),
                                     @"time": [self formattedTime:[NSDate timeIntervalSinceReferenceDate]],
                                     @"event": event,
@@ -2672,6 +2749,55 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                  target,
                  currentBrightness,
                  reason ?: @"unknown");
+}
+
+- (void)recordCaptureCallbackForState:(LumenDisplayState *)state atTime:(NSTimeInterval)time dropped:(BOOL)dropped {
+    if (!state) {
+        return;
+    }
+
+    state.captureCallbackCount++;
+    state.lastCaptureCallbackTimestamp = time;
+    if (dropped) {
+        state.droppedSampleCount++;
+    }
+
+    if (state.captureRateWindowStart <= 0) {
+        state.captureRateWindowStart = time;
+        state.captureRateWindowCount = 0;
+    }
+    state.captureRateWindowCount++;
+    NSTimeInterval elapsed = time - state.captureRateWindowStart;
+    if (elapsed >= 1.0) {
+        state.captureRate = (double)state.captureRateWindowCount / elapsed;
+    }
+    if (elapsed >= 5.0) {
+        state.captureRateWindowStart = time;
+        state.captureRateWindowCount = 0;
+    }
+}
+
+- (void)recordAcceptedSampleForState:(LumenDisplayState *)state atTime:(NSTimeInterval)time {
+    if (!state) {
+        return;
+    }
+
+    state.acceptedSampleCount++;
+    state.lastAcceptedSampleTimestamp = time;
+
+    if (state.acceptedRateWindowStart <= 0) {
+        state.acceptedRateWindowStart = time;
+        state.acceptedRateWindowCount = 0;
+    }
+    state.acceptedRateWindowCount++;
+    NSTimeInterval elapsed = time - state.acceptedRateWindowStart;
+    if (elapsed >= 1.0) {
+        state.acceptedSampleRate = (double)state.acceptedRateWindowCount / elapsed;
+    }
+    if (elapsed >= 5.0) {
+        state.acceptedRateWindowStart = time;
+        state.acceptedRateWindowCount = 0;
+    }
 }
 
 - (void)initialiseBrightnessBaseline:(float)brightness display:(LumenDisplay *)display state:(LumenDisplayState *)state time:(NSTimeInterval)time {
@@ -2985,9 +3111,17 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
 
     double lightness = 0;
+    NSUInteger sampleColumns = MIN((NSUInteger)width, LumenLightnessSampleGridWidth);
+    NSUInteger sampleRows = MIN((NSUInteger)height, LumenLightnessSampleGridHeight);
+    if (sampleColumns == 0 || sampleRows == 0) {
+        CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+        return 0;
+    }
 
-    for (size_t y = 0; y < height; y++) {
-        for (size_t x = 0; x < width; x++) {
+    for (NSUInteger row = 0; row < sampleRows; row++) {
+        size_t y = sampleRows == 1 ? 0 : (size_t)llround((double)row * (double)(height - 1) / (double)(sampleRows - 1));
+        for (NSUInteger column = 0; column < sampleColumns; column++) {
+            size_t x = sampleColumns == 1 ? 0 : (size_t)llround((double)column * (double)(width - 1) / (double)(sampleColumns - 1));
             const unsigned char *pixel = (unsigned char *)baseAddress + (y * bytesPerRow) + (x * 4);
             double l = srgb_to_lightness(pixel[2], pixel[1], pixel[0]);
             lightness += l * l;
@@ -2996,7 +3130,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
 
     CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
 
-    lightness = sqrt(lightness / (width * height));
+    lightness = sqrt(lightness / (sampleColumns * sampleRows));
     return lightness;
 }
 
@@ -3025,6 +3159,28 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         return;
     }
 
+    NSTimeInterval sampleArrivedAt = [NSDate timeIntervalSinceReferenceDate];
+    __block BOOL shouldThrottle = NO;
+    @synchronized (self.lastAcceptedSampleTimeByDisplayKey) {
+        NSTimeInterval lastAccepted = self.lastAcceptedSampleTimeByDisplayKey[displayKey].doubleValue;
+        NSTimeInterval targetInterval = self.targetSampleIntervalByDisplayKey[displayKey].doubleValue;
+        if (targetInterval <= 0) {
+            targetInterval = LumenActiveSampleInterval;
+        }
+        shouldThrottle = lastAccepted > 0 && sampleArrivedAt - lastAccepted < targetInterval;
+        if (!shouldThrottle) {
+            self.lastAcceptedSampleTimeByDisplayKey[displayKey] = @(sampleArrivedAt);
+        }
+    }
+
+    if (shouldThrottle) {
+        dispatch_async(self.controllerQueue, ^{
+            LumenDisplayState *state = self.displayStatesByKey[displayKey];
+            [self recordCaptureCallbackForState:state atTime:sampleArrivedAt dropped:YES];
+        });
+        return;
+    }
+
     BOOL shouldDrop = NO;
     @synchronized (self.processingSampleDisplayKeys) {
         shouldDrop = [self.processingSampleDisplayKeys containsObject:displayKey];
@@ -3036,12 +3192,14 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     if (shouldDrop) {
         dispatch_async(self.controllerQueue, ^{
             LumenDisplayState *state = self.displayStatesByKey[displayKey];
-            state.droppedSampleCount++;
+            [self recordCaptureCallbackForState:state atTime:sampleArrivedAt dropped:YES];
         });
         return;
     }
 
+    NSTimeInterval computeStartedAt = [NSDate timeIntervalSinceReferenceDate];
     double lightness = [self computeLightnessFromSampleBuffer:sampleBuffer];
+    NSTimeInterval computeDuration = [NSDate timeIntervalSinceReferenceDate] - computeStartedAt;
     dispatch_async(self.controllerQueue, ^{
         if (!self.running) {
             @synchronized (self.processingSampleDisplayKeys) {
@@ -3063,8 +3221,26 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
             } else {
                 [(NSMutableDictionary *)self.currentLightnessByDisplayKey setObject:@(lightness) forKey:display.stableKey];
                 LumenDisplayState *state = self.displayStatesByKey[display.stableKey];
+                NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+                [self recordCaptureCallbackForState:state atTime:sampleArrivedAt dropped:NO];
+                [self recordAcceptedSampleForState:state atTime:now];
+                state.lastLightnessComputeDuration = computeDuration;
+
+                double previousLightness = state.latestLightness;
+                BOOL hasPreviousLightness = previousLightness >= 0;
+                BOOL lightnessChanged = !hasPreviousLightness || fabs(lightness - previousLightness) >= LumenLightnessDeltaThreshold;
+                if (!hasPreviousLightness || lightnessChanged) {
+                    state.lightnessStableSince = now;
+                } else if (state.lightnessStableSince <= 0) {
+                    state.lightnessStableSince = now;
+                }
+                BOOL stable = state.lightnessStableSince > 0 && now - state.lightnessStableSince >= LumenStableSampleAfter;
+                @synchronized (self.lastAcceptedSampleTimeByDisplayKey) {
+                    self.targetSampleIntervalByDisplayKey[display.stableKey] = @(stable ? LumenIdleSampleInterval : LumenActiveSampleInterval);
+                }
+
                 state.latestLightness = lightness;
-                state.latestLightnessTime = [NSDate timeIntervalSinceReferenceDate];
+                state.latestLightnessTime = now;
                 state.captureActive = YES;
                 state.captureStatus = @"active";
                 if (state.latestLightnessTime - state.lastLightnessLogTime > 10) {
@@ -3076,7 +3252,11 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                                  lightness);
                 }
 
-                if (![self checkIgnoreList]) {
+                BOOL shouldRunFullControl = lightnessChanged || state.lastFullControlTime <= 0 || now - state.lastFullControlTime >= LumenForceControlInterval;
+                if (!shouldRunFullControl) {
+                    [self setAction:@"skipped: unchanged" reason:@"lightness unchanged within tolerance" display:display state:state];
+                } else if (![self checkIgnoreList]) {
+                    state.lastFullControlTime = now;
                     [self processLightness:lightness forDisplay:display];
                 }
             }
