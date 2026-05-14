@@ -24,5 +24,12 @@
 - (void)resetLearnedCalibrationForDebug;
 - (BOOL)externalSoftwareDimmingEnabled;
 - (void)setExternalSoftwareDimmingEnabled:(BOOL)enabled;
+- (void)resetExternalOverlayCalibration;
+- (void)temporarilyHideExternalOverlaysForScreenshot;
+- (void)restoreExternalOverlays;
+- (NSArray<NSDictionary<NSString *, id> *> *)externalOverlayControlTargets;
+- (void)adjustOverlayForDisplayKey:(NSString *)displayKey brighter:(BOOL)brighter;
+- (void)learnCurrentOverlayForDisplayKey:(NSString *)displayKey;
+- (void)resetOverlayCalibrationForDisplayKey:(NSString *)displayKey;
 
 @end

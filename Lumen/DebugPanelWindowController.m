@@ -98,13 +98,28 @@ static const CGFloat LumenDebugGridRowSpacing = 2.0;
         @{@"title": @"Brightness", @"key": @"brightness"},
         @{@"title": @"Hardware Brightness", @"key": @"hardwareBrightness"},
         @{@"title": @"Target", @"key": @"target"},
+        @{@"title": @"Target Perceived Brightness", @"key": @"overlayTargetBrightness"},
+        @{@"title": @"Overlay Enabled", @"key": @"overlayEnabled"},
         @{@"title": @"Overlay Alpha", @"key": @"overlayAlpha"},
+        @{@"title": @"Overlay Desired Alpha", @"key": @"overlayDesiredAlpha"},
+        @{@"title": @"Overlay Applied Alpha", @"key": @"overlayAppliedAlpha"},
+        @{@"title": @"Temporarily Hidden", @"key": @"overlayTemporarilyHidden"},
+        @{@"title": @"Hidden Reason", @"key": @"overlayHiddenReason"},
+        @{@"title": @"Hidden Until", @"key": @"overlayHiddenUntil"},
+        @{@"title": @"Screenshot Safe Mode", @"key": @"screenshotSafeMode"},
+        @{@"title": @"Window Sharing Type", @"key": @"overlayWindowSharingType"},
+        @{@"title": @"Ignores Mouse Events", @"key": @"overlayIgnoresMouseEvents"},
+        @{@"title": @"Can Become Key/Main", @"key": @"overlayCanBecomeKeyMain"},
         @{@"title": @"Action", @"key": @"action"},
         @{@"title": @"Reason", @"key": @"actionReason"},
         @{@"title": @"Can read brightness", @"key": @"canReadBrightness"},
         @{@"title": @"Can set brightness", @"key": @"canSetBrightness"},
         @{@"title": @"Controllable", @"key": @"controllable"},
         @{@"title": @"Manual Learning", @"key": @"manualLearningAvailable"},
+        @{@"title": @"Overlay Calibration Samples", @"key": @"overlayCalibrationSamples"},
+        @{@"title": @"Overlay Learned Points", @"key": @"overlayLearnedPoints"},
+        @{@"title": @"Overlay Included In Capture", @"key": @"overlayIncludedInCapture"},
+        @{@"title": @"Screenshot Hidden State", @"key": @"screenshotHiddenState"},
         @{@"title": @"Model", @"key": @"model"},
         @{@"title": @"Samples", @"key": @"modelSampleCount"},
         @{@"title": @"Learned Points", @"key": @"learnedPoints"},
@@ -506,13 +521,31 @@ static const CGFloat LumenDebugGridRowSpacing = 2.0;
         if ([metric isEqualToString:@"target"]) {
             return [self formattedNumber:display[@"target"] digits:3];
         }
-        if ([metric isEqualToString:@"overlayAlpha"]) {
-            return [self formattedNumber:display[@"overlayAlpha"] digits:3];
+        if ([metric isEqualToString:@"overlayTargetBrightness"]) {
+            return [self formattedNumber:display[@"overlayTargetBrightness"] digits:3];
+        }
+        if ([metric isEqualToString:@"overlayAlpha"] ||
+            [metric isEqualToString:@"overlayDesiredAlpha"] ||
+            [metric isEqualToString:@"overlayAppliedAlpha"]) {
+            return [self formattedNumber:display[metric] digits:3];
+        }
+        if ([metric isEqualToString:@"overlayCanBecomeKeyMain"]) {
+            NSString *key = [self yesNoOrDash:display[@"overlayCanBecomeKey"]];
+            NSString *main = [self yesNoOrDash:display[@"overlayCanBecomeMain"]];
+            if ([key isEqualToString:@"—"] && [main isEqualToString:@"—"]) {
+                return @"—";
+            }
+            return [NSString stringWithFormat:@"key %@, main %@", key, main];
+        }
+        if ([metric isEqualToString:@"manualLearningAvailable"]) {
+            return [self stringOrDash:display[metric]];
         }
         if ([metric isEqualToString:@"canReadBrightness"] ||
             [metric isEqualToString:@"canSetBrightness"] ||
             [metric isEqualToString:@"controllable"] ||
-            [metric isEqualToString:@"manualLearningAvailable"] ||
+            [metric isEqualToString:@"overlayEnabled"] ||
+            [metric isEqualToString:@"overlayTemporarilyHidden"] ||
+            [metric isEqualToString:@"overlayIgnoresMouseEvents"] ||
             [metric isEqualToString:@"ddcRateLimited"]) {
             return [self yesNoOrDash:display[metric]];
         }

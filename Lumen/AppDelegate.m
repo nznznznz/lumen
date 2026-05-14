@@ -18,7 +18,11 @@
 @property (nonatomic, strong) NSTimer *displayStatusTimer;
 @property (strong, nonatomic) NSMenuItem *displayStatusMenuItem;
 @property (strong, nonatomic) NSMenuItem *debugPanelMenuItem;
-@property (strong, nonatomic) NSMenuItem *externalSoftwareDimmingMenuItem;
+@property (strong, nonatomic) NSMenuItem *disableExternalOverlaysMenuItem;
+@property (strong, nonatomic) NSMenuItem *enableExternalOverlaysMenuItem;
+@property (strong, nonatomic) NSMenuItem *resetExternalOverlayCalibrationMenuItem;
+@property (strong, nonatomic) NSMenuItem *hideExternalOverlaysForScreenshotMenuItem;
+@property (strong, nonatomic) NSMenuItem *restoreExternalOverlaysMenuItem;
 @property (strong, nonatomic) NSMenuItem *resetCalibrationMenuItem;
 @property (strong, nonatomic) IgnoreListWindowController *ignoreListWC;
 @property (strong, nonatomic) DebugPanelWindowController *debugPanelWC;
@@ -55,6 +59,10 @@
                                              selector:@selector(debugPanelVisibilityChanged:)
                                                  name:LumenDebugPanelVisibilityChangedNotification
                                                object:nil];
+    [[[NSWorkspace sharedWorkspace] notificationCenter] addObserver:self
+                                                           selector:@selector(workspaceApplicationActivated:)
+                                                               name:NSWorkspaceDidActivateApplicationNotification
+                                                             object:nil];
     if ([[NSUserDefaults standardUserDefaults] boolForKey:DEFAULTS_DEBUG_PANEL_VISIBLE]) {
         [self showDebugPanel];
     }
@@ -69,6 +77,7 @@
     [self.statsTimer invalidate];
     [self.brightnessController stop];
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
 }
 
 - (IBAction)menuActionQuit:(id)sender {
@@ -110,18 +119,39 @@
                                                   keyEquivalent:@""];
     self.debugPanelMenuItem.target = self;
     [self.statusMenu insertItem:self.debugPanelMenuItem atIndex:3];
-    self.externalSoftwareDimmingMenuItem = [[NSMenuItem alloc] initWithTitle:@"External Software Dimming"
-                                                                      action:@selector(menuActionToggleExternalSoftwareDimming:)
+    self.disableExternalOverlaysMenuItem = [[NSMenuItem alloc] initWithTitle:@"Disable External Overlays"
+                                                                      action:@selector(menuActionDisableExternalOverlays:)
                                                                keyEquivalent:@""];
-    self.externalSoftwareDimmingMenuItem.target = self;
-    [self.statusMenu insertItem:self.externalSoftwareDimmingMenuItem atIndex:4];
+    self.disableExternalOverlaysMenuItem.target = self;
+    [self.statusMenu insertItem:self.disableExternalOverlaysMenuItem atIndex:4];
+    self.enableExternalOverlaysMenuItem = [[NSMenuItem alloc] initWithTitle:@"Enable External Overlays"
+                                                                     action:@selector(menuActionEnableExternalOverlays:)
+                                                              keyEquivalent:@""];
+    self.enableExternalOverlaysMenuItem.target = self;
+    [self.statusMenu insertItem:self.enableExternalOverlaysMenuItem atIndex:5];
+    self.resetExternalOverlayCalibrationMenuItem = [[NSMenuItem alloc] initWithTitle:@"Reset External Overlay Calibration"
+                                                                              action:@selector(menuActionResetExternalOverlayCalibration:)
+                                                                       keyEquivalent:@""];
+    self.resetExternalOverlayCalibrationMenuItem.target = self;
+    [self.statusMenu insertItem:self.resetExternalOverlayCalibrationMenuItem atIndex:6];
+    self.hideExternalOverlaysForScreenshotMenuItem = [[NSMenuItem alloc] initWithTitle:@"Hide External Overlays for Screenshot"
+                                                                                action:@selector(menuActionHideExternalOverlaysForScreenshot:)
+                                                                         keyEquivalent:@"H"];
+    self.hideExternalOverlaysForScreenshotMenuItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption | NSEventModifierFlagShift;
+    self.hideExternalOverlaysForScreenshotMenuItem.target = self;
+    [self.statusMenu insertItem:self.hideExternalOverlaysForScreenshotMenuItem atIndex:7];
+    self.restoreExternalOverlaysMenuItem = [[NSMenuItem alloc] initWithTitle:@"Restore External Overlays"
+                                                                      action:@selector(menuActionRestoreExternalOverlays:)
+                                                               keyEquivalent:@""];
+    self.restoreExternalOverlaysMenuItem.target = self;
+    [self.statusMenu insertItem:self.restoreExternalOverlaysMenuItem atIndex:8];
     self.resetCalibrationMenuItem = [[NSMenuItem alloc] initWithTitle:@"Reset Learned Calibration"
                                                                action:@selector(menuActionResetLearnedCalibration:)
                                                         keyEquivalent:@""];
     self.resetCalibrationMenuItem.target = self;
-    [self.statusMenu insertItem:self.resetCalibrationMenuItem atIndex:5];
+    [self.statusMenu insertItem:self.resetCalibrationMenuItem atIndex:9];
     [self updateDebugPanelMenuItem];
-    [self updateExternalSoftwareDimmingMenuItem];
+    [self updateExternalOverlayMenuItems];
 }
 
 - (IBAction)menuActionToggleDebugPanel:(id)sender {
@@ -153,10 +183,26 @@
     [self updateDebugPanelMenuItem];
 }
 
-- (IBAction)menuActionToggleExternalSoftwareDimming:(id)sender {
-    BOOL enabled = ![self.brightnessController externalSoftwareDimmingEnabled];
-    [self.brightnessController setExternalSoftwareDimmingEnabled:enabled];
-    [self updateExternalSoftwareDimmingMenuItem];
+- (IBAction)menuActionDisableExternalOverlays:(id)sender {
+    [self.brightnessController setExternalSoftwareDimmingEnabled:NO];
+    [self updateExternalOverlayMenuItems];
+}
+
+- (IBAction)menuActionEnableExternalOverlays:(id)sender {
+    [self.brightnessController setExternalSoftwareDimmingEnabled:YES];
+    [self updateExternalOverlayMenuItems];
+}
+
+- (IBAction)menuActionResetExternalOverlayCalibration:(id)sender {
+    [self.brightnessController resetExternalOverlayCalibration];
+}
+
+- (IBAction)menuActionHideExternalOverlaysForScreenshot:(id)sender {
+    [self.brightnessController temporarilyHideExternalOverlaysForScreenshot];
+}
+
+- (IBAction)menuActionRestoreExternalOverlays:(id)sender {
+    [self.brightnessController restoreExternalOverlays];
 }
 
 - (void)setDebugPanelVisibleDefault:(BOOL)visible {
@@ -185,14 +231,47 @@
     self.debugPanelMenuItem.state = visible ? NSControlStateValueOn : NSControlStateValueOff;
 }
 
-- (void)updateExternalSoftwareDimmingMenuItem {
+- (void)updateExternalOverlayMenuItems {
     BOOL enabled = [self.brightnessController externalSoftwareDimmingEnabled];
-    self.externalSoftwareDimmingMenuItem.title = enabled ? @"Disable External Software Dimming" : @"Enable External Software Dimming";
-    self.externalSoftwareDimmingMenuItem.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
+    self.disableExternalOverlaysMenuItem.enabled = enabled;
+    self.enableExternalOverlaysMenuItem.enabled = !enabled;
+    self.disableExternalOverlaysMenuItem.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
+    self.enableExternalOverlaysMenuItem.state = enabled ? NSControlStateValueOff : NSControlStateValueOn;
 }
 
 - (void)displayStatusTick:(NSTimer *)timer {
+    if ([self screenshotUIIsRunning]) {
+        [self.brightnessController temporarilyHideExternalOverlaysForScreenshot];
+    }
+    [self updateExternalOverlayMenuItems];
     [self updateDisplayStatusMenu];
+}
+
+- (void)workspaceApplicationActivated:(NSNotification *)notification {
+    NSRunningApplication *application = notification.userInfo[NSWorkspaceApplicationKey];
+    NSString *bundleIdentifier = application.bundleIdentifier ?: @"";
+    NSString *name = application.localizedName ?: @"";
+    if ([bundleIdentifier isEqualToString:@"com.apple.screenshot"] ||
+        [bundleIdentifier isEqualToString:@"com.apple.screencapture"] ||
+        [name caseInsensitiveCompare:@"Screenshot"] == NSOrderedSame ||
+        [name rangeOfString:@"screencapture" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+        [self.brightnessController temporarilyHideExternalOverlaysForScreenshot];
+    }
+}
+
+- (BOOL)screenshotUIIsRunning {
+    for (NSRunningApplication *application in [NSWorkspace sharedWorkspace].runningApplications) {
+        NSString *bundleIdentifier = application.bundleIdentifier ?: @"";
+        NSString *name = application.localizedName ?: @"";
+        if ([bundleIdentifier rangeOfString:@"screenshot" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [bundleIdentifier rangeOfString:@"screencapture" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [name rangeOfString:@"Screenshot" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [name rangeOfString:@"screencapture" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [name rangeOfString:@"screencaptureui" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            return YES;
+        }
+    }
+    return NO;
 }
 
 - (void)updateDisplayStatusMenu {
@@ -219,8 +298,46 @@
         item.toolTip = [NSString stringWithFormat:@"displayID=%@ key=%@",
                         status[@"displayID"],
                         status[@"key"]];
+        if (![status[@"builtin"] boolValue] && [status[@"backend"] isEqualToString:@"Software Overlay"]) {
+            item.submenu = [self overlayControlsMenuForDisplayStatus:status];
+        }
         [menu addItem:item];
     }
+}
+
+- (NSMenu *)overlayControlsMenuForDisplayStatus:(NSDictionary<NSString *, id> *)status {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:status[@"name"] ?: @"External Display"];
+    NSString *displayKey = status[@"key"];
+    NSArray<NSDictionary<NSString *, NSString *> *> *items = @[
+        @{@"title": @"Brighter Overlay", @"action": NSStringFromSelector(@selector(menuActionOverlayBrighter:))},
+        @{@"title": @"Darker Overlay", @"action": NSStringFromSelector(@selector(menuActionOverlayDarker:))},
+        @{@"title": @"Learn Current Overlay", @"action": NSStringFromSelector(@selector(menuActionOverlayLearnCurrent:))},
+        @{@"title": @"Reset Overlay Calibration", @"action": NSStringFromSelector(@selector(menuActionOverlayReset:))},
+    ];
+    for (NSDictionary<NSString *, NSString *> *itemInfo in items) {
+        SEL action = NSSelectorFromString(itemInfo[@"action"]);
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:itemInfo[@"title"] action:action keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = displayKey;
+        [menu addItem:item];
+    }
+    return menu;
+}
+
+- (IBAction)menuActionOverlayBrighter:(NSMenuItem *)sender {
+    [self.brightnessController adjustOverlayForDisplayKey:sender.representedObject brighter:YES];
+}
+
+- (IBAction)menuActionOverlayDarker:(NSMenuItem *)sender {
+    [self.brightnessController adjustOverlayForDisplayKey:sender.representedObject brighter:NO];
+}
+
+- (IBAction)menuActionOverlayLearnCurrent:(NSMenuItem *)sender {
+    [self.brightnessController learnCurrentOverlayForDisplayKey:sender.representedObject];
+}
+
+- (IBAction)menuActionOverlayReset:(NSMenuItem *)sender {
+    [self.brightnessController resetOverlayCalibrationForDisplayKey:sender.representedObject];
 }
 
 - (NSString *)formattedStatusNumber:(id)value {

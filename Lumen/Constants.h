@@ -16,6 +16,7 @@
 
 #define DEFAULTS_CALIBRATION_POINTS (@"calibrationPoints")
 #define DEFAULTS_DISPLAY_CALIBRATION_POINTS (@"displayCalibrationPoints")
+#define DEFAULTS_DISPLAY_OVERLAY_CALIBRATION_POINTS (@"displayOverlayCalibrationPoints")
 #define DEFAULTS_CALIBRATION_POINTS_MIGRATED (@"calibrationPointsMigratedToPerDisplay")
 #define DEFAULTS_IGNORE_LIST (@"ignoreList")
 #define DEFAULTS_DEBUG_PANEL_FRAME (@"debugPanelFrame")
