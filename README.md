@@ -54,6 +54,12 @@ applications for the first time, use [this method][opening-unsigned].
 
 Feature requests, bug reports, and pull requests are all appreciated.
 
+To build locally, run:
+
+```bash
+xcodebuild -project Lumen.xcodeproj -scheme Lumen -configuration Debug -derivedDataPath /tmp/lumen-derived build
+```
+
 ## Related Projects
 
 * [bencevans/lumenaire](https://github.com/bencevans/lumenaire) - a **cross
