@@ -18,6 +18,7 @@
 @property (nonatomic, strong) NSTimer *displayStatusTimer;
 @property (strong, nonatomic) NSMenuItem *displayStatusMenuItem;
 @property (strong, nonatomic) NSMenuItem *debugPanelMenuItem;
+@property (strong, nonatomic) NSMenuItem *externalSoftwareDimmingMenuItem;
 @property (strong, nonatomic) NSMenuItem *resetCalibrationMenuItem;
 @property (strong, nonatomic) IgnoreListWindowController *ignoreListWC;
 @property (strong, nonatomic) DebugPanelWindowController *debugPanelWC;
@@ -66,6 +67,7 @@
 - (void)applicationWillTerminate:(NSNotification *)aNotification {
     [self.displayStatusTimer invalidate];
     [self.statsTimer invalidate];
+    [self.brightnessController stop];
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
@@ -108,12 +110,18 @@
                                                   keyEquivalent:@""];
     self.debugPanelMenuItem.target = self;
     [self.statusMenu insertItem:self.debugPanelMenuItem atIndex:3];
+    self.externalSoftwareDimmingMenuItem = [[NSMenuItem alloc] initWithTitle:@"External Software Dimming"
+                                                                      action:@selector(menuActionToggleExternalSoftwareDimming:)
+                                                               keyEquivalent:@""];
+    self.externalSoftwareDimmingMenuItem.target = self;
+    [self.statusMenu insertItem:self.externalSoftwareDimmingMenuItem atIndex:4];
     self.resetCalibrationMenuItem = [[NSMenuItem alloc] initWithTitle:@"Reset Learned Calibration"
                                                                action:@selector(menuActionResetLearnedCalibration:)
                                                         keyEquivalent:@""];
     self.resetCalibrationMenuItem.target = self;
-    [self.statusMenu insertItem:self.resetCalibrationMenuItem atIndex:4];
+    [self.statusMenu insertItem:self.resetCalibrationMenuItem atIndex:5];
     [self updateDebugPanelMenuItem];
+    [self updateExternalSoftwareDimmingMenuItem];
 }
 
 - (IBAction)menuActionToggleDebugPanel:(id)sender {
@@ -145,6 +153,12 @@
     [self updateDebugPanelMenuItem];
 }
 
+- (IBAction)menuActionToggleExternalSoftwareDimming:(id)sender {
+    BOOL enabled = ![self.brightnessController externalSoftwareDimmingEnabled];
+    [self.brightnessController setExternalSoftwareDimmingEnabled:enabled];
+    [self updateExternalSoftwareDimmingMenuItem];
+}
+
 - (void)setDebugPanelVisibleDefault:(BOOL)visible {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         [[NSUserDefaults standardUserDefaults] setBool:visible forKey:DEFAULTS_DEBUG_PANEL_VISIBLE];
@@ -169,6 +183,12 @@
     BOOL visible = self.debugPanelWC.window.visible;
     self.debugPanelMenuItem.title = visible ? @"Hide Debug Panel" : @"Show Debug Panel";
     self.debugPanelMenuItem.state = visible ? NSControlStateValueOn : NSControlStateValueOff;
+}
+
+- (void)updateExternalSoftwareDimmingMenuItem {
+    BOOL enabled = [self.brightnessController externalSoftwareDimmingEnabled];
+    self.externalSoftwareDimmingMenuItem.title = enabled ? @"Disable External Software Dimming" : @"Enable External Software Dimming";
+    self.externalSoftwareDimmingMenuItem.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
 }
 
 - (void)displayStatusTick:(NSTimer *)timer {

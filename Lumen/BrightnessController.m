@@ -32,6 +32,9 @@ static NSTimeInterval const LumenDDCMinimumCommandInterval = 0.35;
 static NSTimeInterval const LumenDDCSlowCommandThreshold = 1.5;
 static NSTimeInterval const LumenDDCDegradedCooldown = 5.0;
 static float const LumenDDCSafeMinimumBrightness = 0.05f;
+static float const LumenOverlayDefaultMaxAlpha = 0.70f;
+static float const LumenOverlayMinimumPerceivedBrightness = 0.30f;
+static NSString * const LumenExternalSoftwareDimmingEnabledKey = @"externalSoftwareDimmingEnabled";
 
 static os_log_t LumenDebugLog(void) {
     static os_log_t log;
@@ -56,10 +59,37 @@ static os_log_t LumenDebugLog(void) {
 - (NSString *)failureReasonForDisplay:(LumenDisplay *)display;
 - (NSDictionary<NSString *, id> *)debugInfoForDisplay:(LumenDisplay *)display;
 - (BOOL)shouldReadBackAfterWrite;
+- (BOOL)supportsManualBrightnessLearning;
+- (void)synchronizeActiveDisplays:(NSArray<LumenDisplay *> *)displays;
+- (void)shutdown;
 
 @end
 
 @interface DisplayServicesBrightnessBackend : NSObject <LumenBrightnessBackend>
+@end
+
+@interface LumenSoftwareOverlayState : NSObject
+
+@property (nonatomic, assign) CGDirectDisplayID displayID;
+@property (nonatomic, copy) NSString *displayKey;
+@property (nonatomic, copy) NSString *displayName;
+@property (nonatomic, assign) CGRect frame;
+@property (nonatomic, assign) float targetBrightness;
+@property (nonatomic, assign) float overlayAlpha;
+@property (nonatomic, assign) NSTimeInterval lastUpdateTime;
+@property (nonatomic, strong) NSPanel *panel;
+
+@end
+
+@interface SoftwareOverlayBrightnessBackend : NSObject <LumenBrightnessBackend>
+
+@property (nonatomic, strong) NSMutableDictionary<NSString *, LumenSoftwareOverlayState *> *statesByDisplayKey;
+@property (nonatomic, assign) BOOL enabled;
+@property (nonatomic, assign) float maxOverlayAlpha;
+@property (nonatomic, copy) void (^debugUpdateHandler)(void);
+
+- (void)setEnabled:(BOOL)enabled;
+
 @end
 
 @class LumenDDCMapping;
@@ -211,6 +241,8 @@ static os_log_t LumenDebugLog(void) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, LumenDisplayState *> *displayStatesByKey;
 @property (nonatomic, strong) NSMutableArray<NSDictionary<NSString *, id> *> *debugEvents;
 @property (nonatomic, strong) NSArray<id<LumenBrightnessBackend>> *brightnessBackends;
+@property (nonatomic, strong) SoftwareOverlayBrightnessBackend *softwareOverlayBackend;
+@property (nonatomic, strong) ExternalDisplayBrightnessBackend *ddcBackend;
 @property (nonatomic, strong) Model *model;
 @property (nonatomic, assign) BOOL displayCallbackRegistered;
 @property (nonatomic, assign) NSUInteger displayConfigurationGeneration;
@@ -252,6 +284,7 @@ static os_log_t LumenDebugLog(void) {
 - (void)setAction:(NSString *)action reason:(NSString *)reason display:(LumenDisplay *)display state:(LumenDisplayState *)state;
 - (NSDictionary<NSString *, id> *)debugDictionaryForDisplay:(LumenDisplay *)display;
 - (NSString *)brightnessFailureReasonForDisplay:(LumenDisplay *)display;
+- (BOOL)supportsManualBrightnessLearningForDisplay:(LumenDisplay *)display;
 - (NSString *)shortDisplayKey:(NSString *)stableKey;
 - (NSString *)roleForDisplay:(LumenDisplay *)display;
 - (NSString *)formattedTime:(NSTimeInterval)timestamp;
@@ -333,6 +366,15 @@ static BOOL LumenIsArm64(void) {
 #endif
 }
 
+static float LumenClampFloat(float value, float minimum, float maximum) {
+    return MIN(maximum, MAX(minimum, value));
+}
+
+static float LumenOverlayAlphaForBrightness(float brightness, float maxOverlayAlpha) {
+    float safeTarget = LumenClampFloat(brightness, LumenOverlayMinimumPerceivedBrightness, 1.0f);
+    return LumenClampFloat(1.0f - safeTarget, 0.0f, maxOverlayAlpha);
+}
+
 static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char *key) {
     id value = dictionary[@(key)];
     return [value isKindOfClass:[NSNumber class]] ? value : nil;
@@ -345,6 +387,9 @@ static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char 
 }
 
 - (BOOL)canControlDisplay:(LumenDisplay *)display {
+    if (!display.builtin) {
+        return NO;
+    }
     float level = 1.0f;
     return DisplayServicesGetBrightness(display.displayID, &level) == 0;
 }
@@ -374,6 +419,249 @@ static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char 
         return NO;
     }
     return YES;
+}
+
+@end
+
+@implementation LumenSoftwareOverlayState
+@end
+
+@implementation SoftwareOverlayBrightnessBackend
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        self.statesByDisplayKey = [NSMutableDictionary new];
+        self.enabled = [[NSUserDefaults standardUserDefaults] objectForKey:LumenExternalSoftwareDimmingEnabledKey] ? [[NSUserDefaults standardUserDefaults] boolForKey:LumenExternalSoftwareDimmingEnabledKey] : YES;
+        self.maxOverlayAlpha = LumenOverlayDefaultMaxAlpha;
+    }
+    return self;
+}
+
+- (NSString *)name {
+    return @"Software Overlay";
+}
+
+- (BOOL)canControlDisplay:(LumenDisplay *)display {
+    return self.enabled && !display.builtin;
+}
+
+- (BOOL)canSetDisplay:(LumenDisplay *)display {
+    return [self canControlDisplay:display];
+}
+
+- (BOOL)canReadDisplay:(LumenDisplay *)display {
+    return [self canControlDisplay:display];
+}
+
+- (BOOL)supportsManualBrightnessLearning {
+    return NO;
+}
+
+- (BOOL)shouldReadBackAfterWrite {
+    return NO;
+}
+
+- (float)brightnessForDisplay:(LumenDisplay *)display error:(NSError **)error {
+    if (![self canControlDisplay:display]) {
+        if (error) {
+            *error = LumenBrightnessError(-50, self.enabled ? @"software overlay unsupported for built-in display" : @"external software dimming disabled");
+        }
+        return NAN;
+    }
+
+    @synchronized (self) {
+        LumenSoftwareOverlayState *state = [self stateForDisplayLocked:display create:YES];
+        return 1.0f - state.overlayAlpha;
+    }
+}
+
+- (BOOL)setBrightness:(float)brightness forDisplay:(LumenDisplay *)display error:(NSError **)error {
+    if (![self canControlDisplay:display]) {
+        if (error) {
+            *error = LumenBrightnessError(-51, self.enabled ? @"software overlay unsupported for built-in display" : @"external software dimming disabled");
+        }
+        return NO;
+    }
+
+    float overlayAlpha = LumenOverlayAlphaForBrightness(brightness, self.maxOverlayAlpha);
+    __block LumenSoftwareOverlayState *state = nil;
+    @synchronized (self) {
+        state = [self stateForDisplayLocked:display create:YES];
+        state.displayID = display.displayID;
+        state.displayKey = display.stableKey ?: @"";
+        state.displayName = display.displayName ?: @"";
+        state.frame = display.bounds;
+        state.targetBrightness = brightness;
+        state.overlayAlpha = overlayAlpha;
+        state.lastUpdateTime = [NSDate timeIntervalSinceReferenceDate];
+    }
+
+    [self applyOverlayState:state remove:NO];
+    return YES;
+}
+
+- (NSString *)failureReasonForDisplay:(LumenDisplay *)display {
+    if (display.builtin) {
+        return nil;
+    }
+    return self.enabled ? nil : @"external software dimming disabled";
+}
+
+- (NSDictionary<NSString *, id> *)debugInfoForDisplay:(LumenDisplay *)display {
+    if (display.builtin) {
+        return @{};
+    }
+
+    @synchronized (self) {
+        LumenSoftwareOverlayState *state = self.statesByDisplayKey[display.stableKey];
+        float alpha = state ? state.overlayAlpha : 0.0f;
+        float target = state ? state.targetBrightness : 1.0f;
+        return @{@"controlMethod": self.enabled ? @"Software Overlay" : @"Software Overlay Disabled",
+                 @"backendState": self.enabled ? @"software overlay active" : @"software overlay disabled",
+                 @"overlayEnabled": @(self.enabled),
+                 @"overlayAlpha": @(alpha),
+                 @"overlayMaxAlpha": @(self.maxOverlayAlpha),
+                 @"overlayTargetBrightness": @(target),
+                 @"manualLearningAvailable": @NO,
+                 @"hardwareBrightness": @"unreadable"};
+    }
+}
+
+- (void)synchronizeActiveDisplays:(NSArray<LumenDisplay *> *)displays {
+    NSMutableSet<NSString *> *activeExternalKeys = [NSMutableSet new];
+    for (LumenDisplay *display in displays) {
+        if (display.builtin) {
+            continue;
+        }
+        [activeExternalKeys addObject:display.stableKey];
+        @synchronized (self) {
+            LumenSoftwareOverlayState *state = [self stateForDisplayLocked:display create:YES];
+            state.displayID = display.displayID;
+            state.displayKey = display.stableKey ?: @"";
+            state.displayName = display.displayName ?: @"";
+            state.frame = display.bounds;
+        }
+    }
+
+    NSMutableArray<LumenSoftwareOverlayState *> *removedStates = [NSMutableArray new];
+    NSMutableArray<LumenSoftwareOverlayState *> *updatedStates = [NSMutableArray new];
+    @synchronized (self) {
+        for (NSString *displayKey in self.statesByDisplayKey.allKeys) {
+            LumenSoftwareOverlayState *state = self.statesByDisplayKey[displayKey];
+            if (![activeExternalKeys containsObject:displayKey]) {
+                [removedStates addObject:state];
+                [self.statesByDisplayKey removeObjectForKey:displayKey];
+            } else {
+                [updatedStates addObject:state];
+            }
+        }
+    }
+
+    for (LumenSoftwareOverlayState *state in removedStates) {
+        [self applyOverlayState:state remove:YES];
+    }
+    for (LumenSoftwareOverlayState *state in updatedStates) {
+        [self applyOverlayState:state remove:NO];
+    }
+}
+
+- (void)setEnabled:(BOOL)enabled {
+    _enabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:LumenExternalSoftwareDimmingEnabledKey];
+
+    NSArray<LumenSoftwareOverlayState *> *states = nil;
+    @synchronized (self) {
+        states = self.statesByDisplayKey.allValues;
+    }
+    for (LumenSoftwareOverlayState *state in states) {
+        [self applyOverlayState:state remove:!enabled];
+    }
+    [self notifyDebugStateChanged];
+}
+
+- (void)shutdown {
+    NSArray<LumenSoftwareOverlayState *> *states = nil;
+    @synchronized (self) {
+        states = self.statesByDisplayKey.allValues;
+        [self.statesByDisplayKey removeAllObjects];
+    }
+    for (LumenSoftwareOverlayState *state in states) {
+        [self applyOverlayState:state remove:YES];
+    }
+}
+
+- (LumenSoftwareOverlayState *)stateForDisplayLocked:(LumenDisplay *)display create:(BOOL)create {
+    LumenSoftwareOverlayState *state = self.statesByDisplayKey[display.stableKey];
+    if (!state && create) {
+        state = [LumenSoftwareOverlayState new];
+        state.displayID = display.displayID;
+        state.displayKey = display.stableKey ?: @"";
+        state.displayName = display.displayName ?: @"";
+        state.frame = display.bounds;
+        state.targetBrightness = 1.0f;
+        state.overlayAlpha = 0.0f;
+        self.statesByDisplayKey[display.stableKey] = state;
+    }
+    return state;
+}
+
+- (void)applyOverlayState:(LumenSoftwareOverlayState *)state remove:(BOOL)remove {
+    if (!state) {
+        return;
+    }
+
+    void (^updateWindow)(void) = ^{
+        if (remove || !self.enabled) {
+            [state.panel orderOut:nil];
+            [state.panel close];
+            state.panel = nil;
+            return;
+        }
+
+        if (!state.panel) {
+            NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSRectFromCGRect(state.frame)
+                                                        styleMask:(NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel)
+                                                          backing:NSBackingStoreBuffered
+                                                            defer:NO];
+            panel.opaque = NO;
+            panel.backgroundColor = [NSColor clearColor];
+            panel.ignoresMouseEvents = YES;
+            panel.hidesOnDeactivate = NO;
+            panel.releasedWhenClosed = NO;
+            panel.level = CGWindowLevelForKey(kCGOverlayWindowLevelKey);
+            panel.collectionBehavior = (NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                        NSWindowCollectionBehaviorStationary |
+                                        NSWindowCollectionBehaviorFullScreenAuxiliary |
+                                        NSWindowCollectionBehaviorIgnoresCycle);
+
+            NSView *contentView = [[NSView alloc] initWithFrame:NSRectFromCGRect(state.frame)];
+            contentView.wantsLayer = YES;
+            panel.contentView = contentView;
+            state.panel = panel;
+        }
+
+        [state.panel setFrame:NSRectFromCGRect(state.frame) display:NO];
+        state.panel.contentView.frame = NSMakeRect(0, 0, state.frame.size.width, state.frame.size.height);
+        state.panel.contentView.layer.backgroundColor = [[NSColor colorWithCalibratedWhite:0.0 alpha:state.overlayAlpha] CGColor];
+        if (state.overlayAlpha <= 0.001f) {
+            [state.panel orderOut:nil];
+        } else {
+            [state.panel orderFrontRegardless];
+        }
+    };
+
+    if ([NSThread isMainThread]) {
+        updateWindow();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), updateWindow);
+    }
+}
+
+- (void)notifyDebugStateChanged {
+    if (self.debugUpdateHandler) {
+        self.debugUpdateHandler();
+    }
 }
 
 @end
@@ -1150,8 +1438,18 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                                      @"generatedAt": @([NSDate timeIntervalSinceReferenceDate]),
                                      @"displays": @[],
                                      @"events": @[]};
+        SoftwareOverlayBrightnessBackend *softwareOverlayBackend = [SoftwareOverlayBrightnessBackend new];
         ExternalDisplayBrightnessBackend *ddcBackend = [ExternalDisplayBrightnessBackend new];
         __weak typeof(self) weakSelf = self;
+        softwareOverlayBackend.debugUpdateHandler = ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) {
+                return;
+            }
+            dispatch_async(strongSelf.controllerQueue, ^{
+                [strongSelf updateDebugSnapshot];
+            });
+        };
         ddcBackend.debugUpdateHandler = ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) {
@@ -1161,7 +1459,10 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                 [strongSelf updateDebugSnapshot];
             });
         };
+        self.softwareOverlayBackend = softwareOverlayBackend;
+        self.ddcBackend = ddcBackend;
         self.brightnessBackends = @[[DisplayServicesBrightnessBackend new],
+                                    softwareOverlayBackend,
                                     ddcBackend];
         self.model = [Model new];
         self.ignoreList = [[IgnoreListController alloc] init];
@@ -1196,8 +1497,14 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         CGDisplayRemoveReconfigurationCallback(LumenDisplayReconfigurationCallback, (__bridge void *)self);
         self.displayCallbackRegistered = NO;
     }
+    [self.softwareOverlayBackend shutdown];
     dispatch_async(self.controllerQueue, ^{
         [self stopCaptureStreams];
+        for (id<LumenBrightnessBackend> backend in self.brightnessBackends) {
+            if ([backend respondsToSelector:@selector(shutdown)]) {
+                [backend shutdown];
+            }
+        }
         [self updateDebugSnapshot];
     });
 }
@@ -1212,6 +1519,11 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     [self stopCaptureStreams];
 
     NSArray<LumenDisplay *> *displays = [LumenDisplay activeDisplays];
+    for (id<LumenBrightnessBackend> backend in self.brightnessBackends) {
+        if ([backend respondsToSelector:@selector(synchronizeActiveDisplays:)]) {
+            [backend synchronizeActiveDisplays:displays];
+        }
+    }
     NSMutableDictionary<NSString *, LumenDisplayState *> *states = [NSMutableDictionary new];
     for (LumenDisplay *display in displays) {
         LumenDisplayState *state = self.displayStatesByKey[display.stableKey] ?: [LumenDisplayState new];
@@ -1554,6 +1866,53 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     state.latestBrightness = setPoint;
     state.latestBrightnessTime = currentTime;
 
+    if (![self supportsManualBrightnessLearningForDisplay:display]) {
+        state.hasValidBrightnessBaseline = NO;
+        state.noticed = NO;
+        state.lastTrainingDecision = @"not trained: software overlay has no hardware manual learning";
+
+        if (fabsf(brightness - state.lastAssigned) <= CHANGE_NOTICE) {
+            [self setAction:@"skipped: unchanged" reason:@"overlay unchanged within tolerance" display:display state:state];
+            [self addSkippedDecisionEventForDisplay:display
+                                              state:state
+                                          lightness:lightness
+                                             target:brightness
+                                  currentBrightness:setPoint
+                                             reason:@"unchanged"];
+            return;
+        }
+
+        NSError *setError = nil;
+        if ([self setBrightness:brightness forDisplay:display updateState:NO error:&setError]) {
+            float overlayAlpha = LumenOverlayAlphaForBrightness(brightness, LumenOverlayDefaultMaxAlpha);
+            state.canSetBrightness = YES;
+            state.lastWriteError = @"";
+            state.lastWrittenBrightness = brightness;
+            state.lastWriteTime = currentTime;
+            state.lastAssigned = brightness;
+            state.lastAutoBrightnessTime = currentTime;
+            state.latestBrightness = brightness;
+            state.latestBrightnessTime = currentTime;
+            [self setAction:[NSString stringWithFormat:@"overlay alpha %.3f", overlayAlpha]
+                     reason:@"fast software dimming"
+                    display:display
+                      state:state];
+            [self addDebugEvent:[NSString stringWithFormat:@"software overlay alpha %.3f target %.3f", overlayAlpha, brightness]
+                        display:display];
+        } else {
+            state.canSetBrightness = NO;
+            state.lastWriteError = setError.localizedDescription ?: @"software overlay update failed";
+            [self setAction:@"skipped: overlay failed" reason:@"software overlay update failed" display:display state:state];
+            [self addSkippedDecisionEventForDisplay:display
+                                              state:state
+                                          lightness:lightness
+                                             target:brightness
+                                  currentBrightness:setPoint
+                                             reason:@"overlay failed"];
+        }
+        return;
+    }
+
     if (!state.hasValidBrightnessBaseline) {
         [self initialiseBrightnessBaseline:setPoint display:display state:state time:currentTime];
     } else if ([self isOwnWriteReadback:setPoint state:state time:currentTime]) {
@@ -1748,6 +2107,12 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     state.lastWriteError = @"";
     state.lastWrittenBrightness = brightness;
     state.lastWriteTime = [NSDate timeIntervalSinceReferenceDate];
+    if (![self supportsManualBrightnessLearningForDisplay:display]) {
+        state.latestBrightness = brightness;
+        state.latestBrightnessTime = state.lastWriteTime;
+        state.lastSet = brightness;
+        state.hasValidBrightnessBaseline = NO;
+    }
 
     BOOL shouldReadBack = updateState;
     if ([backend respondsToSelector:@selector(shouldReadBackAfterWrite)]) {
@@ -1827,6 +2192,32 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
             [self addDebugEvent:@"learned calibration reset" display:display];
         }
         [self updateDebugSnapshot];
+    });
+}
+
+- (BOOL)externalSoftwareDimmingEnabled {
+    return self.softwareOverlayBackend.enabled;
+}
+
+- (void)setExternalSoftwareDimmingEnabled:(BOOL)enabled {
+    [self.softwareOverlayBackend setEnabled:enabled];
+    dispatch_async(self.controllerQueue, ^{
+        for (LumenDisplay *display in self.activeDisplays) {
+            if (!display.builtin && [display.brightnessBackendName isEqualToString:self.softwareOverlayBackend.name]) {
+                LumenDisplayState *state = self.displayStatesByKey[display.stableKey];
+                if (!enabled) {
+                    display.brightnessControllable = NO;
+                    display.brightnessBackendName = @"unsupported";
+                    state.canReadBrightness = NO;
+                    state.canSetBrightness = NO;
+                    state.hasValidBrightnessBaseline = NO;
+                    state.noticed = NO;
+                    state.lastTrainingDecision = @"not trained: software overlay disabled";
+                    [self setAction:@"skipped: software overlay disabled" reason:@"software overlay disabled" display:display state:state];
+                }
+            }
+        }
+        [self reloadDisplaysAndStreams];
     });
 }
 
@@ -1925,7 +2316,8 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                                     @"lastWrittenBrightness": @(state.lastWrittenBrightness),
                                     @"lastWriteTimestamp": @(state.lastWriteTime),
                                     @"lastWriteError": state.lastWriteError ?: @"",
-                                    @"lastReadError": state.lastReadError ?: @""} mutableCopy];
+                                    @"lastReadError": state.lastReadError ?: @"",
+                                    @"manualLearningAvailable": @([self supportsManualBrightnessLearningForDisplay:display])} mutableCopy];
     id<LumenBrightnessBackend> backend = [self backendForDisplay:display];
     if ([backend respondsToSelector:@selector(debugInfoForDisplay:)]) {
         [debug addEntriesFromDictionary:[backend debugInfoForDisplay:display]];
@@ -1933,6 +2325,15 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         debug[@"backendState"] = @"read/write";
     } else {
         debug[@"backendState"] = @"unsupported";
+    }
+    if (!display.builtin && backend != self.ddcBackend && [self.ddcBackend respondsToSelector:@selector(debugInfoForDisplay:)]) {
+        NSDictionary<NSString *, id> *ddcDebug = [self.ddcBackend debugInfoForDisplay:display];
+        for (NSString *key in ddcDebug) {
+            if ([key hasPrefix:@"ddc"] || [key isEqualToString:@"backendState"]) {
+                NSString *targetKey = [key isEqualToString:@"backendState"] ? @"ddcBackendState" : key;
+                debug[targetKey] = ddcDebug[key];
+            }
+        }
     }
     return debug;
 }
@@ -2114,6 +2515,14 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         }
     }
     return nil;
+}
+
+- (BOOL)supportsManualBrightnessLearningForDisplay:(LumenDisplay *)display {
+    id<LumenBrightnessBackend> backend = [self backendForDisplay:display];
+    if ([backend respondsToSelector:@selector(supportsManualBrightnessLearning)]) {
+        return [backend supportsManualBrightnessLearning];
+    }
+    return YES;
 }
 
 - (LumenDisplay *)displayForKey:(NSString *)displayKey {

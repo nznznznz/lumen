@@ -90,17 +90,21 @@ static const CGFloat LumenDebugGridRowSpacing = 2.0;
     return @[
         @{@"title": @"Role", @"key": @"role"},
         @{@"title": @"Backend", @"key": @"backend"},
+        @{@"title": @"Control Method", @"key": @"controlMethod"},
         @{@"title": @"Backend State", @"key": @"backendState"},
         @{@"title": @"Capture", @"key": @"capture"},
         @{@"title": @"Lightness L*", @"key": @"lightnessLStar"},
         @{@"title": @"Lightness", @"key": @"lightness"},
         @{@"title": @"Brightness", @"key": @"brightness"},
+        @{@"title": @"Hardware Brightness", @"key": @"hardwareBrightness"},
         @{@"title": @"Target", @"key": @"target"},
+        @{@"title": @"Overlay Alpha", @"key": @"overlayAlpha"},
         @{@"title": @"Action", @"key": @"action"},
         @{@"title": @"Reason", @"key": @"actionReason"},
         @{@"title": @"Can read brightness", @"key": @"canReadBrightness"},
         @{@"title": @"Can set brightness", @"key": @"canSetBrightness"},
         @{@"title": @"Controllable", @"key": @"controllable"},
+        @{@"title": @"Manual Learning", @"key": @"manualLearningAvailable"},
         @{@"title": @"Model", @"key": @"model"},
         @{@"title": @"Samples", @"key": @"modelSampleCount"},
         @{@"title": @"Learned Points", @"key": @"learnedPoints"},
@@ -111,6 +115,8 @@ static const CGFloat LumenDebugGridRowSpacing = 2.0;
         @{@"title": @"Read Failures", @"key": @"readFailures"},
         @{@"title": @"Write Failures", @"key": @"writeFailures"},
         @{@"title": @"Command In Flight", @"key": @"commandInFlight"},
+        @{@"title": @"DDC State", @"key": @"ddcBackendState"},
+        @{@"title": @"DDC Rate Limited", @"key": @"ddcRateLimited"},
         @{@"title": @"Last DDC Read Duration", @"key": @"lastDDCReadDuration"},
         @{@"title": @"Last DDC Write Duration", @"key": @"lastDDCWriteDuration"},
         @{@"title": @"Display ID", @"key": @"displayID"},
@@ -490,12 +496,24 @@ static const CGFloat LumenDebugGridRowSpacing = 2.0;
             }
             return [self formattedNumber:display[@"brightness"] digits:3];
         }
+        if ([metric isEqualToString:@"hardwareBrightness"]) {
+            id value = display[@"hardwareBrightness"];
+            if ([value isKindOfClass:[NSString class]]) {
+                return [self stringOrDash:value];
+            }
+            return [self formattedNumber:value digits:3];
+        }
         if ([metric isEqualToString:@"target"]) {
             return [self formattedNumber:display[@"target"] digits:3];
         }
+        if ([metric isEqualToString:@"overlayAlpha"]) {
+            return [self formattedNumber:display[@"overlayAlpha"] digits:3];
+        }
         if ([metric isEqualToString:@"canReadBrightness"] ||
             [metric isEqualToString:@"canSetBrightness"] ||
-            [metric isEqualToString:@"controllable"]) {
+            [metric isEqualToString:@"controllable"] ||
+            [metric isEqualToString:@"manualLearningAvailable"] ||
+            [metric isEqualToString:@"ddcRateLimited"]) {
             return [self yesNoOrDash:display[metric]];
         }
         if ([metric isEqualToString:@"readFailures"]) {

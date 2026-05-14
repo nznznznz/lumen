@@ -22,5 +22,7 @@
 - (NSString *)debugSnapshotText;
 - (void)recordDebugPanelRenderDuration:(NSTimeInterval)duration;
 - (void)resetLearnedCalibrationForDebug;
+- (BOOL)externalSoftwareDimmingEnabled;
+- (void)setExternalSoftwareDimmingEnabled:(BOOL)enabled;
 
 @end
