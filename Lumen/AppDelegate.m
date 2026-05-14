@@ -7,6 +7,7 @@
 #import "stats.h"
 #import "IgnoreListWindowController.h"
 #import "DebugPanelWindowController.h"
+#import <math.h>
 
 @interface AppDelegate ()
 
@@ -24,6 +25,9 @@
 @property (strong, nonatomic) NSMenuItem *hideExternalOverlaysForScreenshotMenuItem;
 @property (strong, nonatomic) NSMenuItem *restoreExternalOverlaysMenuItem;
 @property (strong, nonatomic) NSMenuItem *resetCalibrationMenuItem;
+@property (strong, nonatomic) NSMenuItem *samplingRateMenuItem;
+@property (strong, nonatomic) NSMenuItem *adaptiveSamplingMenuItem;
+@property (strong, nonatomic) NSArray<NSMenuItem *> *samplingRateItems;
 @property (strong, nonatomic) IgnoreListWindowController *ignoreListWC;
 @property (strong, nonatomic) DebugPanelWindowController *debugPanelWC;
 
@@ -150,8 +154,46 @@
                                                         keyEquivalent:@""];
     self.resetCalibrationMenuItem.target = self;
     [self.statusMenu insertItem:self.resetCalibrationMenuItem atIndex:9];
+    self.samplingRateMenuItem = [[NSMenuItem alloc] initWithTitle:@"Sampling Rate" action:nil keyEquivalent:@""];
+    self.samplingRateMenuItem.submenu = [[NSMenu alloc] initWithTitle:@"Sampling Rate"];
+    [self.statusMenu insertItem:self.samplingRateMenuItem atIndex:10];
+    [self buildSamplingRateMenu];
+    self.adaptiveSamplingMenuItem = [[NSMenuItem alloc] initWithTitle:@"Adaptive Sampling"
+                                                               action:@selector(menuActionToggleAdaptiveSampling:)
+                                                        keyEquivalent:@""];
+    self.adaptiveSamplingMenuItem.target = self;
+    [self.statusMenu insertItem:self.adaptiveSamplingMenuItem atIndex:11];
     [self updateDebugPanelMenuItem];
     [self updateExternalOverlayMenuItems];
+    [self updateSamplingMenuItems];
+}
+
+- (void)buildSamplingRateMenu {
+    NSMenu *menu = self.samplingRateMenuItem.submenu;
+    [menu removeAllItems];
+    NSArray<NSDictionary<NSString *, id> *> *items = @[
+        @{@"title": @"Low Power: 0.5 fps", @"fps": @0.5},
+        @{@"title": @"Balanced: 1 fps", @"fps": @1.0},
+        @{@"title": @"Responsive: 2 fps", @"fps": @2.0},
+        @{@"title": @"High: 4 fps", @"fps": @4.0},
+    ];
+    NSMutableArray<NSMenuItem *> *rateItems = [NSMutableArray new];
+    for (NSDictionary<NSString *, id> *itemInfo in items) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:itemInfo[@"title"]
+                                                      action:@selector(menuActionSetSamplingRate:)
+                                               keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = itemInfo[@"fps"];
+        [menu addItem:item];
+        [rateItems addObject:item];
+    }
+    [menu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *customItem = [[NSMenuItem alloc] initWithTitle:@"Custom..."
+                                                        action:@selector(menuActionSetCustomSamplingRate:)
+                                                 keyEquivalent:@""];
+    customItem.target = self;
+    [menu addItem:customItem];
+    self.samplingRateItems = rateItems.copy;
 }
 
 - (IBAction)menuActionToggleDebugPanel:(id)sender {
@@ -239,11 +281,52 @@
     self.enableExternalOverlaysMenuItem.state = enabled ? NSControlStateValueOff : NSControlStateValueOn;
 }
 
+- (void)updateSamplingMenuItems {
+    double currentFPS = [self.brightnessController samplingFPS];
+    for (NSMenuItem *item in self.samplingRateItems) {
+        double fps = [item.representedObject doubleValue];
+        item.state = fabs(currentFPS - fps) < 0.01 ? NSControlStateValueOn : NSControlStateValueOff;
+    }
+    self.samplingRateMenuItem.title = [NSString stringWithFormat:@"Sampling Rate: %@", [self.brightnessController samplingModeName]];
+    self.adaptiveSamplingMenuItem.state = [self.brightnessController adaptiveSamplingEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
+}
+
+- (IBAction)menuActionSetSamplingRate:(NSMenuItem *)sender {
+    [self.brightnessController setSamplingFPS:[sender.representedObject doubleValue]];
+    [self updateSamplingMenuItems];
+}
+
+- (IBAction)menuActionSetCustomSamplingRate:(id)sender {
+    NSAlert *alert = [NSAlert new];
+    alert.messageText = @"Custom sampling FPS";
+    alert.informativeText = @"Enter a maximum analysis rate from 0.2 to 4 fps.";
+    NSTextField *input = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 180, 24)];
+    input.stringValue = [NSString stringWithFormat:@"%.2f", [self.brightnessController samplingFPS]];
+    alert.accessoryView = input;
+    [alert addButtonWithTitle:@"Set"];
+    [alert addButtonWithTitle:@"Cancel"];
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return;
+    }
+    double fps = input.doubleValue;
+    if (fps <= 0) {
+        return;
+    }
+    [self.brightnessController setSamplingFPS:fps];
+    [self updateSamplingMenuItems];
+}
+
+- (IBAction)menuActionToggleAdaptiveSampling:(id)sender {
+    [self.brightnessController setAdaptiveSamplingEnabled:![self.brightnessController adaptiveSamplingEnabled]];
+    [self updateSamplingMenuItems];
+}
+
 - (void)displayStatusTick:(NSTimer *)timer {
     if ([self screenshotUIIsRunning]) {
         [self.brightnessController temporarilyHideExternalOverlaysForScreenshot];
     }
     [self updateExternalOverlayMenuItems];
+    [self updateSamplingMenuItems];
     [self updateDisplayStatusMenu];
 }
 

@@ -94,6 +94,16 @@ static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
         @{@"title": @"Control Method", @"key": @"controlMethod"},
         @{@"title": @"Backend State", @"key": @"backendState"},
         @{@"title": @"Capture", @"key": @"capture"},
+        @{@"title": @"Sampling Mode", @"key": @"samplingMode"},
+        @{@"title": @"Max Analysis FPS", @"key": @"maxAnalysisFPS"},
+        @{@"title": @"Effective Analysis FPS", @"key": @"effectiveAnalysisFPS"},
+        @{@"title": @"Last Accepted Sample Age", @"key": @"lastAcceptedSampleAge"},
+        @{@"title": @"Dropped Frames", @"key": @"droppedFrames"},
+        @{@"title": @"Coalesced Frames", @"key": @"coalescedFrames"},
+        @{@"title": @"Cheap Change Delta", @"key": @"cheapChangeDelta"},
+        @{@"title": @"Last Heavy Analysis Duration", @"key": @"lastHeavyAnalysisDuration"},
+        @{@"title": @"Heavy Analyses Skipped", @"key": @"heavyAnalysesSkipped"},
+        @{@"title": @"Forced Refresh Interval", @"key": @"forcedRefreshInterval"},
         @{@"title": @"Capture Rate", @"key": @"captureRate"},
         @{@"title": @"Accepted Sample Rate", @"key": @"acceptedSampleRate"},
         @{@"title": @"Dropped Samples", @"key": @"droppedSampleCount"},
@@ -515,6 +525,8 @@ static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
         }
         if ([metric isEqualToString:@"captureRate"] ||
             [metric isEqualToString:@"acceptedSampleRate"] ||
+            [metric isEqualToString:@"maxAnalysisFPS"] ||
+            [metric isEqualToString:@"effectiveAnalysisFPS"] ||
             [metric isEqualToString:@"debugRefreshRate"]) {
             if ([metric isEqualToString:@"debugRefreshRate"]) {
                 return [self formattedRate:@(1.0 / LumenDebugPanelRefreshInterval)];
@@ -522,14 +534,23 @@ static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
             return [self formattedRate:display[metric]];
         }
         if ([metric isEqualToString:@"droppedSampleCount"] ||
+            [metric isEqualToString:@"droppedFrames"] ||
+            [metric isEqualToString:@"coalescedFrames"] ||
+            [metric isEqualToString:@"heavyAnalysesSkipped"] ||
             [metric isEqualToString:@"overlayUpdatesSkipped"]) {
             return [self formattedInteger:display[metric]];
         }
         if ([metric isEqualToString:@"lastLightnessComputeDuration"] ||
+            [metric isEqualToString:@"lastHeavyAnalysisDuration"] ||
             [metric isEqualToString:@"lastControlLoopDuration"] ||
             [metric isEqualToString:@"debugPanelLastRenderDuration"] ||
+            [metric isEqualToString:@"lastAcceptedSampleAge"] ||
+            [metric isEqualToString:@"forcedRefreshInterval"] ||
             [metric isEqualToString:@"lastOverlayUpdateDuration"]) {
             return [self formattedSeconds:display[metric]];
+        }
+        if ([metric isEqualToString:@"cheapChangeDelta"]) {
+            return [self formattedNumber:display[metric] digits:3];
         }
         if ([metric isEqualToString:@"lightnessLStar"]) {
             return [self formattedNumber:display[@"lightnessLStar"] digits:1];

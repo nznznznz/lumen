@@ -21,6 +21,8 @@
 #define DEFAULTS_IGNORE_LIST (@"ignoreList")
 #define DEFAULTS_DEBUG_PANEL_FRAME (@"debugPanelFrame")
 #define DEFAULTS_DEBUG_PANEL_VISIBLE (@"debugPanelVisible")
+#define DEFAULTS_SAMPLING_FPS (@"samplingFPS")
+#define DEFAULTS_ADAPTIVE_SAMPLING_ENABLED (@"adaptiveSamplingEnabled")
 
 #define NOTIFICATION_IGNORE_LIST_CHANGED (@"notification.ignoreListChanged")
 

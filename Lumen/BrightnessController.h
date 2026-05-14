@@ -31,5 +31,10 @@
 - (void)adjustOverlayForDisplayKey:(NSString *)displayKey brighter:(BOOL)brighter;
 - (void)learnCurrentOverlayForDisplayKey:(NSString *)displayKey;
 - (void)resetOverlayCalibrationForDisplayKey:(NSString *)displayKey;
+- (double)samplingFPS;
+- (void)setSamplingFPS:(double)fps;
+- (NSString *)samplingModeName;
+- (BOOL)adaptiveSamplingEnabled;
+- (void)setAdaptiveSamplingEnabled:(BOOL)enabled;
 
 @end

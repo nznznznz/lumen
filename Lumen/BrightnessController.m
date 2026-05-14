@@ -45,8 +45,15 @@ static NSTimeInterval const LumenActiveSampleInterval = 0.5;
 static NSTimeInterval const LumenIdleSampleInterval = 1.0;
 static NSTimeInterval const LumenStableSampleAfter = 4.0;
 static NSTimeInterval const LumenForceControlInterval = 3.0;
+static NSTimeInterval const LumenForcedHeavyAnalysisInterval = 8.0;
 static double const LumenLightnessDeltaThreshold = 0.5;
+static double const LumenCheapChangeThreshold = 0.03;
 static float const LumenOverlayAlphaDeltaThreshold = 0.005f;
+static double const LumenDefaultSamplingFPS = 2.0;
+static double const LumenMinimumSamplingFPS = 0.2;
+static double const LumenMaximumSamplingFPS = 4.0;
+static NSUInteger const LumenCheapFingerprintGridWidth = 32;
+static NSUInteger const LumenCheapFingerprintGridHeight = 18;
 static NSUInteger const LumenLightnessSampleGridWidth = 80;
 static NSUInteger const LumenLightnessSampleGridHeight = 45;
 
@@ -119,6 +126,16 @@ static os_log_t LumenDebugLog(void) {
 @property (nonatomic, assign) NSTimeInterval lastOverlayUpdateDuration;
 @property (nonatomic, strong) NSPanel *panel;
 
+@end
+
+@interface LumenPendingSample : NSObject
+
+@property (nonatomic, strong) id sampleBufferObject;
+@property (nonatomic, assign) NSTimeInterval arrivalTime;
+
+@end
+
+@implementation LumenPendingSample
 @end
 
 @interface SoftwareOverlayBrightnessBackend : NSObject <LumenBrightnessBackend>
@@ -232,8 +249,13 @@ static os_log_t LumenDebugLog(void) {
 @property (nonatomic, assign) double captureRate;
 @property (nonatomic, assign) double acceptedSampleRate;
 @property (nonatomic, assign) NSTimeInterval lastLightnessComputeDuration;
+@property (nonatomic, assign) NSTimeInterval lastHeavyAnalysisDuration;
 @property (nonatomic, assign) NSTimeInterval lastFullControlTime;
+@property (nonatomic, assign) NSTimeInterval lastHeavyAnalysisTime;
 @property (nonatomic, assign) NSTimeInterval lightnessStableSince;
+@property (nonatomic, assign) double lastCheapChangeDelta;
+@property (nonatomic, assign) NSUInteger coalescedFrameCount;
+@property (nonatomic, assign) NSUInteger heavyAnalysisSkippedCount;
 @property (nonatomic, copy) NSString *lastSkippedEventSignature;
 @property (nonatomic, assign) NSTimeInterval lastSkippedEventTime;
 @property (nonatomic, assign) NSUInteger skippedEventRepeatCount;
@@ -294,8 +316,13 @@ static os_log_t LumenDebugLog(void) {
         self.captureRate = 0;
         self.acceptedSampleRate = 0;
         self.lastLightnessComputeDuration = 0;
+        self.lastHeavyAnalysisDuration = 0;
         self.lastFullControlTime = 0;
+        self.lastHeavyAnalysisTime = 0;
         self.lightnessStableSince = 0;
+        self.lastCheapChangeDelta = 0;
+        self.coalescedFrameCount = 0;
+        self.heavyAnalysisSkippedCount = 0;
         self.lastSkippedEventSignature = @"";
         self.lastSkippedEventTime = 0;
         self.skippedEventRepeatCount = 0;
@@ -315,6 +342,8 @@ static os_log_t LumenDebugLog(void) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, LumenDisplayState *> *displayStatesByKey;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *lastAcceptedSampleTimeByDisplayKey;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *targetSampleIntervalByDisplayKey;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSData *> *cheapFingerprintByDisplayKey;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, LumenPendingSample *> *pendingSamplesByDisplayKey;
 @property (nonatomic, strong) NSMutableArray<NSDictionary<NSString *, id> *> *debugEvents;
 @property (nonatomic, strong) NSArray<id<LumenBrightnessBackend>> *brightnessBackends;
 @property (nonatomic, strong) SoftwareOverlayBrightnessBackend *softwareOverlayBackend;
@@ -342,11 +371,19 @@ static os_log_t LumenDebugLog(void) {
 @property (nonatomic, assign) NSTimeInterval lastControlLoopDuration;
 @property (nonatomic, assign) NSTimeInterval snapshotGenerationDuration;
 @property (nonatomic, assign) NSTimeInterval debugPanelLastRenderDuration;
+@property (nonatomic, assign) double configuredSamplingFPS;
+@property (nonatomic, assign) BOOL adaptiveSampling;
 
 - (void)reloadDisplaysAndStreams;
 - (void)stopCaptureStreams;
 - (void)processLightness:(double)lightness forDisplay:(LumenDisplay *)display;
 - (void)updateDebugSnapshot;
+- (void)processSampleBuffer:(CMSampleBufferRef)sampleBuffer displayKey:(NSString *)displayKey arrivedAt:(NSTimeInterval)sampleArrivedAt processingReserved:(BOOL)processingReserved;
+- (void)finishProcessingSampleForDisplayKey:(NSString *)displayKey;
+- (BOOL)reserveSampleProcessingForDisplayKey:(NSString *)displayKey sampleBuffer:(CMSampleBufferRef)sampleBuffer arrivedAt:(NSTimeInterval)sampleArrivedAt;
+- (NSTimeInterval)minimumAnalysisIntervalForDisplayKey:(NSString *)displayKey;
+- (NSData *)cheapFingerprintFromSampleBuffer:(CMSampleBufferRef)sampleBuffer;
+- (double)cheapDeltaFromFingerprint:(NSData *)fingerprint previousFingerprint:(NSData *)previousFingerprint;
 - (double)computeLightnessFromSampleBuffer:(CMSampleBufferRef)sampleBuffer;
 - (void)recordCaptureCallbackForState:(LumenDisplayState *)state atTime:(NSTimeInterval)time dropped:(BOOL)dropped;
 - (void)recordAcceptedSampleForState:(LumenDisplayState *)state atTime:(NSTimeInterval)time;
@@ -452,6 +489,10 @@ static BOOL LumenIsArm64(void) {
 }
 
 static float LumenClampFloat(float value, float minimum, float maximum) {
+    return MIN(maximum, MAX(minimum, value));
+}
+
+static double LumenClampDouble(double value, double minimum, double maximum) {
     return MIN(maximum, MAX(minimum, value));
 }
 
@@ -1631,11 +1672,22 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         self.displayStatesByKey = [NSMutableDictionary new];
         self.lastAcceptedSampleTimeByDisplayKey = [NSMutableDictionary new];
         self.targetSampleIntervalByDisplayKey = [NSMutableDictionary new];
+        self.cheapFingerprintByDisplayKey = [NSMutableDictionary new];
+        self.pendingSamplesByDisplayKey = [NSMutableDictionary new];
         self.debugEvents = [NSMutableArray new];
         self.controllerQueue = dispatch_queue_create("com.anishathalye.lumen.controller", DISPATCH_QUEUE_SERIAL);
         self.sampleQueue = dispatch_queue_create("com.anishathalye.lumen.samples", DISPATCH_QUEUE_CONCURRENT);
         self.snapshotQueue = dispatch_queue_create("com.anishathalye.lumen.snapshot", DISPATCH_QUEUE_CONCURRENT);
         self.processingSampleDisplayKeys = [NSMutableSet new];
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        double savedFPS = [defaults doubleForKey:DEFAULTS_SAMPLING_FPS];
+        self.configuredSamplingFPS = savedFPS > 0 ? LumenClampDouble(savedFPS, LumenMinimumSamplingFPS, LumenMaximumSamplingFPS) : LumenDefaultSamplingFPS;
+        if ([defaults objectForKey:DEFAULTS_ADAPTIVE_SAMPLING_ENABLED] == nil) {
+            self.adaptiveSampling = YES;
+            [defaults setBool:YES forKey:DEFAULTS_ADAPTIVE_SAMPLING_ENABLED];
+        } else {
+            self.adaptiveSampling = [defaults boolForKey:DEFAULTS_ADAPTIVE_SAMPLING_ENABLED];
+        }
         self.latestDebugSnapshot = @{@"running": @NO,
                                      @"version": @0,
                                      @"generatedAt": @([NSDate timeIntervalSinceReferenceDate]),
@@ -1682,6 +1734,58 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
 
 - (BOOL)isRunning {
     return self.running;
+}
+
+- (double)samplingFPS {
+    return self.configuredSamplingFPS > 0 ? self.configuredSamplingFPS : LumenDefaultSamplingFPS;
+}
+
+- (void)setSamplingFPS:(double)fps {
+    double clamped = LumenClampDouble(fps, LumenMinimumSamplingFPS, LumenMaximumSamplingFPS);
+    self.configuredSamplingFPS = clamped;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        [[NSUserDefaults standardUserDefaults] setDouble:clamped forKey:DEFAULTS_SAMPLING_FPS];
+    });
+    @synchronized (self.lastAcceptedSampleTimeByDisplayKey) {
+        [self.targetSampleIntervalByDisplayKey removeAllObjects];
+    }
+    dispatch_async(self.controllerQueue, ^{
+        [self updateDebugSnapshot];
+    });
+}
+
+- (NSString *)samplingModeName {
+    double fps = [self samplingFPS];
+    if (fabs(fps - 0.5) < 0.01) {
+        return @"Low Power";
+    }
+    if (fabs(fps - 1.0) < 0.01) {
+        return @"Balanced";
+    }
+    if (fabs(fps - 2.0) < 0.01) {
+        return @"Responsive";
+    }
+    if (fabs(fps - 4.0) < 0.01) {
+        return @"High";
+    }
+    return @"Custom";
+}
+
+- (BOOL)adaptiveSamplingEnabled {
+    return self.adaptiveSampling;
+}
+
+- (void)setAdaptiveSamplingEnabled:(BOOL)enabled {
+    self.adaptiveSampling = enabled;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:DEFAULTS_ADAPTIVE_SAMPLING_ENABLED];
+    });
+    @synchronized (self.lastAcceptedSampleTimeByDisplayKey) {
+        [self.targetSampleIntervalByDisplayKey removeAllObjects];
+    }
+    dispatch_async(self.controllerQueue, ^{
+        [self updateDebugSnapshot];
+    });
 }
 
 - (void)start {
@@ -1831,7 +1935,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
     config.width = MAX(1, captureDisplay.width / LINEAR_SUBSAMPLE);
     config.height = MAX(1, captureDisplay.height / LINEAR_SUBSAMPLE);
-    config.minimumFrameInterval = CMTimeMakeWithSeconds(LumenActiveSampleInterval, 600);
+    config.minimumFrameInterval = CMTimeMakeWithSeconds(1.0 / LumenMaximumSamplingFPS, 600);
     config.pixelFormat = kCVPixelFormatType_32BGRA;
     config.showsCursor = NO;
     config.capturesAudio = NO;
@@ -1915,6 +2019,10 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     @synchronized (self.lastAcceptedSampleTimeByDisplayKey) {
         [self.lastAcceptedSampleTimeByDisplayKey removeAllObjects];
         [self.targetSampleIntervalByDisplayKey removeAllObjects];
+        [self.cheapFingerprintByDisplayKey removeAllObjects];
+    }
+    @synchronized (self.pendingSamplesByDisplayKey) {
+        [self.pendingSamplesByDisplayKey removeAllObjects];
     }
 }
 
@@ -2576,6 +2684,8 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     }
 
     float normalizedLightness = state.latestLightness >= 0 ? state.latestLightness / 100.0 : -1;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    double samplingFPS = [self samplingFPS];
     BOOL softwareOverlay = [self isSoftwareOverlayDisplay:display];
     NSUInteger overlaySampleCount = (self.overlayCalibrationPointsByDisplayKey[display.stableKey] ?: @[]).count;
     NSString *overlayPoints = [self overlayLearnedPointsSummaryForDisplayKey:display.stableKey];
@@ -2611,11 +2721,22 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                                     @"lastControlLoopDuration": @(self.lastControlLoopDuration),
                                     @"snapshotGenerationDuration": @(self.snapshotGenerationDuration),
                                     @"debugPanelLastRenderDuration": @(self.debugPanelLastRenderDuration),
+                                    @"samplingMode": [self samplingModeName],
+                                    @"adaptiveSamplingEnabled": @(self.adaptiveSampling),
+                                    @"maxAnalysisFPS": @(samplingFPS),
+                                    @"effectiveAnalysisFPS": @(state.acceptedSampleRate),
+                                    @"lastAcceptedSampleAge": @(state.lastAcceptedSampleTimestamp > 0 ? now - state.lastAcceptedSampleTimestamp : -1),
+                                    @"forcedRefreshInterval": @(LumenForcedHeavyAnalysisInterval),
+                                    @"cheapChangeDelta": @(state.lastCheapChangeDelta),
+                                    @"heavyAnalysesSkipped": @(state.heavyAnalysisSkippedCount),
+                                    @"lastHeavyAnalysisDuration": @(state.lastHeavyAnalysisDuration),
                                     @"captureCallbackCount": @(state.captureCallbackCount),
                                     @"acceptedSampleCount": @(state.acceptedSampleCount),
                                     @"captureRate": @(state.captureRate),
                                     @"acceptedSampleRate": @(state.acceptedSampleRate),
                                     @"droppedSampleCount": @(state.droppedSampleCount),
+                                    @"droppedFrames": @(state.droppedSampleCount),
+                                    @"coalescedFrames": @(state.coalescedFrameCount),
                                     @"lastLightnessComputeDuration": @(state.lastLightnessComputeDuration),
                                     @"lastCaptureCallbackTimestamp": @(state.lastCaptureCallbackTimestamp),
                                     @"lastAcceptedSampleTimestamp": @(state.lastAcceptedSampleTimestamp),
@@ -3087,6 +3208,128 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     return nil;
 }
 
+- (NSTimeInterval)minimumAnalysisIntervalForDisplayKey:(NSString *)displayKey {
+    double fps = [self samplingFPS];
+    NSTimeInterval configuredInterval = fps > 0 ? 1.0 / fps : 1.0 / LumenDefaultSamplingFPS;
+    if (!self.adaptiveSampling) {
+        return configuredInterval;
+    }
+
+    NSNumber *targetInterval = nil;
+    @synchronized (self.lastAcceptedSampleTimeByDisplayKey) {
+        targetInterval = self.targetSampleIntervalByDisplayKey[displayKey];
+    }
+    NSTimeInterval adaptiveInterval = targetInterval.doubleValue;
+    if (adaptiveInterval <= 0) {
+        adaptiveInterval = configuredInterval;
+    }
+    return MAX(configuredInterval, adaptiveInterval);
+}
+
+- (BOOL)reserveSampleProcessingForDisplayKey:(NSString *)displayKey sampleBuffer:(CMSampleBufferRef)sampleBuffer arrivedAt:(NSTimeInterval)sampleArrivedAt {
+    BOOL shouldCoalesce = NO;
+    @synchronized (self.processingSampleDisplayKeys) {
+        shouldCoalesce = [self.processingSampleDisplayKeys containsObject:displayKey];
+        if (!shouldCoalesce) {
+            [self.processingSampleDisplayKeys addObject:displayKey];
+        }
+    }
+
+    if (!shouldCoalesce) {
+        return YES;
+    }
+
+    LumenPendingSample *pendingSample = [LumenPendingSample new];
+    pendingSample.sampleBufferObject = CFBridgingRelease(CFRetain(sampleBuffer));
+    pendingSample.arrivalTime = sampleArrivedAt;
+    @synchronized (self.pendingSamplesByDisplayKey) {
+        self.pendingSamplesByDisplayKey[displayKey] = pendingSample;
+    }
+    dispatch_async(self.controllerQueue, ^{
+        LumenDisplayState *state = self.displayStatesByKey[displayKey];
+        [self recordCaptureCallbackForState:state atTime:sampleArrivedAt dropped:NO];
+        state.coalescedFrameCount++;
+    });
+    return NO;
+}
+
+- (void)finishProcessingSampleForDisplayKey:(NSString *)displayKey {
+    __block LumenPendingSample *pendingSample = nil;
+    @synchronized (self.pendingSamplesByDisplayKey) {
+        pendingSample = self.pendingSamplesByDisplayKey[displayKey];
+        if (pendingSample) {
+            [self.pendingSamplesByDisplayKey removeObjectForKey:displayKey];
+        }
+    }
+
+    if (pendingSample) {
+        dispatch_async(self.sampleQueue, ^{
+            [self processSampleBuffer:(__bridge CMSampleBufferRef)pendingSample.sampleBufferObject
+                            displayKey:displayKey
+                            arrivedAt:pendingSample.arrivalTime
+                   processingReserved:YES];
+        });
+        return;
+    }
+
+    @synchronized (self.processingSampleDisplayKeys) {
+        [self.processingSampleDisplayKeys removeObject:displayKey];
+    }
+}
+
+- (NSData *)cheapFingerprintFromSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!imageBuffer) {
+        return nil;
+    }
+    if (CVPixelBufferGetPixelFormatType(imageBuffer) != kCVPixelFormatType_32BGRA) {
+        return nil;
+    }
+    if (CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        return nil;
+    }
+
+    void *baseAddress = CVPixelBufferGetBaseAddress(imageBuffer);
+    size_t width = CVPixelBufferGetWidth(imageBuffer);
+    size_t height = CVPixelBufferGetHeight(imageBuffer);
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(imageBuffer);
+    NSUInteger sampleColumns = MIN((NSUInteger)width, LumenCheapFingerprintGridWidth);
+    NSUInteger sampleRows = MIN((NSUInteger)height, LumenCheapFingerprintGridHeight);
+    if (sampleColumns == 0 || sampleRows == 0) {
+        CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+        return nil;
+    }
+
+    NSMutableData *fingerprint = [NSMutableData dataWithLength:sampleColumns * sampleRows];
+    UInt8 *samples = fingerprint.mutableBytes;
+    NSUInteger index = 0;
+    for (NSUInteger row = 0; row < sampleRows; row++) {
+        size_t y = sampleRows == 1 ? 0 : (size_t)llround((double)row * (double)(height - 1) / (double)(sampleRows - 1));
+        for (NSUInteger column = 0; column < sampleColumns; column++) {
+            size_t x = sampleColumns == 1 ? 0 : (size_t)llround((double)column * (double)(width - 1) / (double)(sampleColumns - 1));
+            const UInt8 *pixel = (UInt8 *)baseAddress + (y * bytesPerRow) + (x * 4);
+            double luma = (0.2126 * pixel[2]) + (0.7152 * pixel[1]) + (0.0722 * pixel[0]);
+            samples[index++] = (UInt8)LumenClampDouble(llround(luma), 0, 255);
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+    return fingerprint.copy;
+}
+
+- (double)cheapDeltaFromFingerprint:(NSData *)fingerprint previousFingerprint:(NSData *)previousFingerprint {
+    if (fingerprint.length == 0 || previousFingerprint.length == 0 || fingerprint.length != previousFingerprint.length) {
+        return INFINITY;
+    }
+    const UInt8 *current = fingerprint.bytes;
+    const UInt8 *previous = previousFingerprint.bytes;
+    NSUInteger length = fingerprint.length;
+    NSUInteger totalDifference = 0;
+    for (NSUInteger i = 0; i < length; i++) {
+        totalDifference += (NSUInteger)abs((int)current[i] - (int)previous[i]);
+    }
+    return (double)totalDifference / ((double)length * 255.0);
+}
+
 - (double)computeLightnessFromSampleBuffer:(CMSampleBufferRef)sampleBuffer {
     CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!imageBuffer) {
@@ -3160,13 +3403,17 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     }
 
     NSTimeInterval sampleArrivedAt = [NSDate timeIntervalSinceReferenceDate];
+    if (![self reserveSampleProcessingForDisplayKey:displayKey sampleBuffer:sampleBuffer arrivedAt:sampleArrivedAt]) {
+        return;
+    }
+    [self processSampleBuffer:sampleBuffer displayKey:displayKey arrivedAt:sampleArrivedAt processingReserved:YES];
+}
+
+- (void)processSampleBuffer:(CMSampleBufferRef)sampleBuffer displayKey:(NSString *)displayKey arrivedAt:(NSTimeInterval)sampleArrivedAt processingReserved:(BOOL)processingReserved {
     __block BOOL shouldThrottle = NO;
     @synchronized (self.lastAcceptedSampleTimeByDisplayKey) {
         NSTimeInterval lastAccepted = self.lastAcceptedSampleTimeByDisplayKey[displayKey].doubleValue;
-        NSTimeInterval targetInterval = self.targetSampleIntervalByDisplayKey[displayKey].doubleValue;
-        if (targetInterval <= 0) {
-            targetInterval = LumenActiveSampleInterval;
-        }
+        NSTimeInterval targetInterval = [self minimumAnalysisIntervalForDisplayKey:displayKey];
         shouldThrottle = lastAccepted > 0 && sampleArrivedAt - lastAccepted < targetInterval;
         if (!shouldThrottle) {
             self.lastAcceptedSampleTimeByDisplayKey[displayKey] = @(sampleArrivedAt);
@@ -3177,22 +3424,45 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         dispatch_async(self.controllerQueue, ^{
             LumenDisplayState *state = self.displayStatesByKey[displayKey];
             [self recordCaptureCallbackForState:state atTime:sampleArrivedAt dropped:YES];
+            [self finishProcessingSampleForDisplayKey:displayKey];
         });
         return;
     }
 
-    BOOL shouldDrop = NO;
-    @synchronized (self.processingSampleDisplayKeys) {
-        shouldDrop = [self.processingSampleDisplayKeys containsObject:displayKey];
-        if (!shouldDrop) {
-            [self.processingSampleDisplayKeys addObject:displayKey];
+    NSData *fingerprint = [self cheapFingerprintFromSampleBuffer:sampleBuffer];
+    __block NSData *previousFingerprint = nil;
+    @synchronized (self.lastAcceptedSampleTimeByDisplayKey) {
+        previousFingerprint = self.cheapFingerprintByDisplayKey[displayKey];
+        if (fingerprint) {
+            self.cheapFingerprintByDisplayKey[displayKey] = fingerprint;
         }
     }
+    double cheapDelta = [self cheapDeltaFromFingerprint:fingerprint previousFingerprint:previousFingerprint];
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    __block BOOL shouldRunHeavyAnalysis = !isfinite(cheapDelta) || cheapDelta >= LumenCheapChangeThreshold;
+    __block BOOL forcedRefresh = NO;
+    dispatch_sync(self.controllerQueue, ^{
+        LumenDisplayState *state = self.displayStatesByKey[displayKey];
+        NSTimeInterval lastHeavy = state.lastHeavyAnalysisTime;
+        forcedRefresh = lastHeavy <= 0 || now - lastHeavy >= LumenForcedHeavyAnalysisInterval;
+        shouldRunHeavyAnalysis = shouldRunHeavyAnalysis || forcedRefresh || !self.adaptiveSampling;
+    });
 
-    if (shouldDrop) {
+    if (!shouldRunHeavyAnalysis) {
         dispatch_async(self.controllerQueue, ^{
+            LumenDisplay *display = [self displayForKey:displayKey];
             LumenDisplayState *state = self.displayStatesByKey[displayKey];
-            [self recordCaptureCallbackForState:state atTime:sampleArrivedAt dropped:YES];
+            [self recordCaptureCallbackForState:state atTime:sampleArrivedAt dropped:NO];
+            state.lastCheapChangeDelta = isfinite(cheapDelta) ? cheapDelta : 0;
+            state.heavyAnalysisSkippedCount++;
+            if (display && state) {
+                [self setAction:@"sample skipped: content unchanged"
+                         reason:@"cheap change below threshold"
+                        display:display
+                          state:state];
+            }
+            [self updateDebugSnapshot];
+            [self finishProcessingSampleForDisplayKey:displayKey];
         });
         return;
     }
@@ -3202,9 +3472,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     NSTimeInterval computeDuration = [NSDate timeIntervalSinceReferenceDate] - computeStartedAt;
     dispatch_async(self.controllerQueue, ^{
         if (!self.running) {
-            @synchronized (self.processingSampleDisplayKeys) {
-                [self.processingSampleDisplayKeys removeObject:displayKey];
-            }
+            [self finishProcessingSampleForDisplayKey:displayKey];
             return;
         }
         NSTimeInterval controlStartedAt = [NSDate timeIntervalSinceReferenceDate];
@@ -3225,6 +3493,9 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                 [self recordCaptureCallbackForState:state atTime:sampleArrivedAt dropped:NO];
                 [self recordAcceptedSampleForState:state atTime:now];
                 state.lastLightnessComputeDuration = computeDuration;
+                state.lastHeavyAnalysisDuration = computeDuration;
+                state.lastHeavyAnalysisTime = now;
+                state.lastCheapChangeDelta = isfinite(cheapDelta) ? cheapDelta : 0;
 
                 double previousLightness = state.latestLightness;
                 BOOL hasPreviousLightness = previousLightness >= 0;
@@ -3236,7 +3507,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                 }
                 BOOL stable = state.lightnessStableSince > 0 && now - state.lightnessStableSince >= LumenStableSampleAfter;
                 @synchronized (self.lastAcceptedSampleTimeByDisplayKey) {
-                    self.targetSampleIntervalByDisplayKey[display.stableKey] = @(stable ? LumenIdleSampleInterval : LumenActiveSampleInterval);
+                    self.targetSampleIntervalByDisplayKey[display.stableKey] = @((self.adaptiveSampling && stable) ? LumenIdleSampleInterval : LumenActiveSampleInterval);
                 }
 
                 state.latestLightness = lightness;
@@ -3252,7 +3523,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                                  lightness);
                 }
 
-                BOOL shouldRunFullControl = lightnessChanged || state.lastFullControlTime <= 0 || now - state.lastFullControlTime >= LumenForceControlInterval;
+                BOOL shouldRunFullControl = forcedRefresh || lightnessChanged || state.lastFullControlTime <= 0 || now - state.lastFullControlTime >= LumenForceControlInterval;
                 if (!shouldRunFullControl) {
                     [self setAction:@"skipped: unchanged" reason:@"lightness unchanged within tolerance" display:display state:state];
                 } else if (![self checkIgnoreList]) {
@@ -3267,9 +3538,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                      "Control loop end duration=%{public}.3f",
                      self.lastControlLoopDuration);
         [self updateDebugSnapshot];
-        @synchronized (self.processingSampleDisplayKeys) {
-            [self.processingSampleDisplayKeys removeObject:displayKey];
-        }
+        [self finishProcessingSampleForDisplayKey:displayKey];
     });
 }
 
