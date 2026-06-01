@@ -117,6 +117,7 @@ static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
         @{@"title": @"Hardware Brightness", @"key": @"hardwareBrightness"},
         @{@"title": @"Target", @"key": @"target"},
         @{@"title": @"Target Perceived Brightness", @"key": @"overlayTargetBrightness"},
+        @{@"title": @"Maximum Dimming", @"key": @"maximumDimming"},
         @{@"title": @"Overlay Enabled", @"key": @"overlayEnabled"},
         @{@"title": @"Overlay Alpha", @"key": @"overlayAlpha"},
         @{@"title": @"Overlay Desired Alpha", @"key": @"overlayDesiredAlpha"},
@@ -577,6 +578,9 @@ static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
         if ([metric isEqualToString:@"overlayTargetBrightness"]) {
             return [self formattedNumber:display[@"overlayTargetBrightness"] digits:3];
         }
+        if ([metric isEqualToString:@"maximumDimming"]) {
+            return [self formattedPercent:display[@"maximumDimming"]];
+        }
         if ([metric isEqualToString:@"overlayAlpha"] ||
             [metric isEqualToString:@"overlayDesiredAlpha"] ||
             [metric isEqualToString:@"overlayAppliedAlpha"]) {
@@ -673,6 +677,17 @@ static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
 - (NSString *)formattedRate:(id)value {
     NSString *number = [self formattedNumber:value digits:2];
     return [number isEqualToString:@"—"] ? number : [number stringByAppendingString:@"/s"];
+}
+
+- (NSString *)formattedPercent:(id)value {
+    if (![value isKindOfClass:[NSNumber class]]) {
+        return @"—";
+    }
+    double number = [value doubleValue];
+    if (!isfinite(number) || number < 0) {
+        return @"—";
+    }
+    return [NSString stringWithFormat:@"%.0f%%", number * 100.0];
 }
 
 - (NSString *)formattedInteger:(id)value {

@@ -33,6 +33,7 @@ static NSTimeInterval const LumenDDCSlowCommandThreshold = 1.5;
 static NSTimeInterval const LumenDDCDegradedCooldown = 5.0;
 static float const LumenDDCSafeMinimumBrightness = 0.05f;
 static float const LumenOverlayDefaultMaxAlpha = 0.70f;
+static float const LumenMaximumDimmingLimit = 0.70f;
 static float const LumenOverlayMinimumPerceivedBrightness = 0.30f;
 static float const LumenOverlayDefaultDarkLStar = 25.0f;
 static float const LumenOverlayDefaultBrightLStar = 90.0f;
@@ -373,6 +374,7 @@ static os_log_t LumenDebugLog(void) {
 @property (nonatomic, assign) NSTimeInterval debugPanelLastRenderDuration;
 @property (nonatomic, assign) double configuredSamplingFPS;
 @property (nonatomic, assign) BOOL adaptiveSampling;
+@property (atomic, assign) float maximumDimming;
 
 - (void)reloadDisplaysAndStreams;
 - (void)stopCaptureStreams;
@@ -402,6 +404,7 @@ static os_log_t LumenDebugLog(void) {
 - (NSString *)brightnessFailureReasonForDisplay:(LumenDisplay *)display;
 - (BOOL)supportsManualBrightnessLearningForDisplay:(LumenDisplay *)display;
 - (BOOL)isSoftwareOverlayDisplay:(LumenDisplay *)display;
+- (float)brightnessByApplyingMaximumDimming:(float)brightness;
 - (float)overlayTargetBrightnessForLightness:(float)lightness displayKey:(NSString *)displayKey;
 - (void)observeOverlayOutput:(float)output forInput:(float)input displayKey:(NSString *)displayKey;
 - (void)restoreOverlayCalibrationDefaults;
@@ -496,9 +499,17 @@ static double LumenClampDouble(double value, double minimum, double maximum) {
     return MIN(maximum, MAX(minimum, value));
 }
 
+static float LumenClampMaximumDimming(float maximumDimming) {
+    return LumenClampFloat(maximumDimming, 0.0f, LumenMaximumDimmingLimit);
+}
+
+static float LumenMinimumBrightnessForMaximumDimming(float maximumDimming) {
+    return 1.0f - LumenClampMaximumDimming(maximumDimming);
+}
+
 static float LumenOverlayAlphaForBrightness(float brightness, float maxOverlayAlpha) {
-    float safeTarget = LumenClampFloat(brightness, LumenOverlayMinimumPerceivedBrightness, 1.0f);
-    return LumenClampFloat(1.0f - safeTarget, 0.0f, maxOverlayAlpha);
+    float safeTarget = LumenClampFloat(brightness, LumenMinimumBrightnessForMaximumDimming(maxOverlayAlpha), 1.0f);
+    return LumenClampFloat(1.0f - safeTarget, 0.0f, LumenClampMaximumDimming(maxOverlayAlpha));
 }
 
 static float LumenOverlayPointValue(NSDictionary<NSString *, NSNumber *> *point, NSString *key) {
@@ -564,13 +575,34 @@ static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char 
     if (self) {
         self.statesByDisplayKey = [NSMutableDictionary new];
         self.enabled = [[NSUserDefaults standardUserDefaults] objectForKey:LumenExternalSoftwareDimmingEnabledKey] ? [[NSUserDefaults standardUserDefaults] boolForKey:LumenExternalSoftwareDimmingEnabledKey] : YES;
-        self.maxOverlayAlpha = LumenOverlayDefaultMaxAlpha;
+        NSNumber *savedMaximumDimming = [[NSUserDefaults standardUserDefaults] objectForKey:DEFAULTS_MAXIMUM_DIMMING];
+        self.maxOverlayAlpha = savedMaximumDimming ? LumenClampMaximumDimming(savedMaximumDimming.floatValue) : LumenOverlayDefaultMaxAlpha;
     }
     return self;
 }
 
 - (NSString *)name {
     return @"Software Overlay";
+}
+
+- (void)setMaxOverlayAlpha:(float)maxOverlayAlpha {
+    float clamped = LumenClampMaximumDimming(maxOverlayAlpha);
+    NSArray<LumenSoftwareOverlayState *> *states = nil;
+    @synchronized (self) {
+        if (fabsf(_maxOverlayAlpha - clamped) < 0.0005f) {
+            _maxOverlayAlpha = clamped;
+            return;
+        }
+        _maxOverlayAlpha = clamped;
+        states = self.statesByDisplayKey.allValues;
+        for (LumenSoftwareOverlayState *state in states) {
+            state.desiredOverlayAlpha = LumenOverlayAlphaForBrightness(state.targetBrightness, _maxOverlayAlpha);
+        }
+    }
+    for (LumenSoftwareOverlayState *state in states) {
+        [self applyOverlayState:state remove:NO];
+    }
+    [self notifyDebugStateChanged];
 }
 
 - (BOOL)canControlDisplay:(LumenDisplay *)display {
@@ -1662,6 +1694,8 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
 
 @implementation BrightnessController
 
+@synthesize maximumDimming = _maximumDimming;
+
 - (id)init {
     self = [super init];
     if (self) {
@@ -1682,6 +1716,8 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
         double savedFPS = [defaults doubleForKey:DEFAULTS_SAMPLING_FPS];
         self.configuredSamplingFPS = savedFPS > 0 ? LumenClampDouble(savedFPS, LumenMinimumSamplingFPS, LumenMaximumSamplingFPS) : LumenDefaultSamplingFPS;
+        NSNumber *savedMaximumDimming = [defaults objectForKey:DEFAULTS_MAXIMUM_DIMMING];
+        _maximumDimming = savedMaximumDimming ? LumenClampMaximumDimming(savedMaximumDimming.floatValue) : LumenOverlayDefaultMaxAlpha;
         if ([defaults objectForKey:DEFAULTS_ADAPTIVE_SAMPLING_ENABLED] == nil) {
             self.adaptiveSampling = YES;
             [defaults setBool:YES forKey:DEFAULTS_ADAPTIVE_SAMPLING_ENABLED];
@@ -1715,6 +1751,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
             });
         };
         self.softwareOverlayBackend = softwareOverlayBackend;
+        self.softwareOverlayBackend.maxOverlayAlpha = self.maximumDimming;
         self.ddcBackend = ddcBackend;
         self.brightnessBackends = @[[DisplayServicesBrightnessBackend new],
                                     softwareOverlayBackend,
@@ -1784,6 +1821,59 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         [self.targetSampleIntervalByDisplayKey removeAllObjects];
     }
     dispatch_async(self.controllerQueue, ^{
+        [self updateDebugSnapshot];
+    });
+}
+
+- (float)maximumDimming {
+    float maximumDimming = _maximumDimming;
+    return LumenClampMaximumDimming(maximumDimming);
+}
+
+- (float)maximumDimmingLimit {
+    return LumenMaximumDimmingLimit;
+}
+
+- (void)setMaximumDimming:(float)maximumDimming {
+    float clamped = LumenClampMaximumDimming(maximumDimming);
+    _maximumDimming = clamped;
+    self.softwareOverlayBackend.maxOverlayAlpha = clamped;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        [[NSUserDefaults standardUserDefaults] setFloat:clamped forKey:DEFAULTS_MAXIMUM_DIMMING];
+    });
+    dispatch_async(self.controllerQueue, ^{
+        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+        for (LumenDisplay *display in self.activeDisplays) {
+            LumenDisplayState *state = self.displayStatesByKey[display.stableKey];
+            if (!state || !display.brightnessControllable) {
+                continue;
+            }
+            float sourceTarget = state.latestTargetBrightness;
+            if (state.latestLightness > 0) {
+                sourceTarget = [self isSoftwareOverlayDisplay:display] ? [self overlayTargetBrightnessForLightness:(float)state.latestLightness displayKey:display.stableKey] : [self.model predictFromInput:state.latestLightness displayKey:display.stableKey];
+            }
+            if (sourceTarget < 0) {
+                continue;
+            }
+            float cappedTarget = [self brightnessByApplyingMaximumDimming:sourceTarget];
+            if (state.lastAssigned >= 0 && fabsf(cappedTarget - state.lastAssigned) <= CHANGE_NOTICE) {
+                continue;
+            }
+            NSError *error = nil;
+            if ([self setBrightness:cappedTarget forDisplay:display updateState:!([self isSoftwareOverlayDisplay:display]) error:&error]) {
+                state.latestTargetBrightness = cappedTarget;
+                state.latestTargetTime = now;
+                state.lastAssigned = cappedTarget;
+                state.lastAutoBrightnessTime = now;
+                state.lastWriteError = @"";
+                [self setAction:[NSString stringWithFormat:@"maximum dimming %.0f%%", clamped * 100.0f]
+                         reason:@"maximum dimming changed"
+                        display:display
+                          state:state];
+            } else {
+                state.lastWriteError = error.localizedDescription ?: @"maximum dimming apply failed";
+            }
+        }
         [self updateDebugSnapshot];
     });
 }
@@ -2048,6 +2138,23 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
             LumenDisplayState *state = self.displayStatesByKey[display.stableKey];
             [self setAction:@"skipped: ignored app" reason:@"skipped ignored app" display:display state:state];
             state.lastTrainingDecision = @"ignored app";
+            if ([self isSoftwareOverlayDisplay:display]) {
+                NSError *setError = nil;
+                if ([self setBrightness:1.0f forDisplay:display updateState:NO error:&setError]) {
+                    NSTimeInterval currentTime = [NSDate timeIntervalSinceReferenceDate];
+                    state.latestTargetBrightness = 1.0f;
+                    state.latestTargetTime = currentTime;
+                    state.latestBrightness = 1.0f;
+                    state.latestBrightnessTime = currentTime;
+                    state.lastAssigned = 1.0f;
+                    state.lastAutoBrightnessTime = currentTime;
+                    state.lastWriteError = @"";
+                    [self setAction:@"overlay cleared" reason:@"ignored app frontmost" display:display state:state];
+                } else {
+                    state.lastWriteError = setError.localizedDescription ?: @"ignored-app overlay clear failed";
+                    [self addDebugEvent:[NSString stringWithFormat:@"ignored-app overlay clear failed: %@", state.lastWriteError] display:display];
+                }
+            }
         }
 
         float preferredBrightness = [self.ignoreList preferredBrightnessForURLString:activeAppURLString].floatValue;
@@ -2065,6 +2172,9 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         } else if (preferredBrightness > -1) {
             for (LumenDisplay *display in self.activeDisplays) {
                 if (!display.brightnessControllable) {
+                    continue;
+                }
+                if ([self isSoftwareOverlayDisplay:display]) {
                     continue;
                 }
                 NSError *setError = nil;
@@ -2092,7 +2202,8 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     }
 
     NSTimeInterval currentTime = [NSDate timeIntervalSinceReferenceDate];
-    float brightness = [self isSoftwareOverlayDisplay:display] ? [self overlayTargetBrightnessForLightness:(float)lightness displayKey:display.stableKey] : [self.model predictFromInput:lightness displayKey:display.stableKey];
+    float predictedBrightness = [self isSoftwareOverlayDisplay:display] ? [self overlayTargetBrightnessForLightness:(float)lightness displayKey:display.stableKey] : [self.model predictFromInput:lightness displayKey:display.stableKey];
+    float brightness = [self brightnessByApplyingMaximumDimming:predictedBrightness];
     state.latestTargetBrightness = brightness;
     state.latestTargetTime = currentTime;
 
@@ -2192,7 +2303,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
 
         NSError *setError = nil;
         if ([self setBrightness:brightness forDisplay:display updateState:NO error:&setError]) {
-            float overlayAlpha = LumenOverlayAlphaForBrightness(brightness, LumenOverlayDefaultMaxAlpha);
+            float overlayAlpha = LumenOverlayAlphaForBrightness(brightness, self.maximumDimming);
             state.canSetBrightness = YES;
             state.lastWriteError = @"";
             state.lastWrittenBrightness = brightness;
@@ -2578,6 +2689,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         float adjusted = LumenClampFloat(currentBrightness + (brighter ? LumenOverlayManualStep : -LumenOverlayManualStep),
                                          LumenOverlayMinimumPerceivedBrightness,
                                          1.0f);
+        adjusted = [self brightnessByApplyingMaximumDimming:adjusted];
         NSError *error = nil;
         if ([self setBrightness:adjusted forDisplay:display updateState:NO error:&error]) {
             state.latestTargetBrightness = adjusted;
@@ -2723,6 +2835,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
                                     @"debugPanelLastRenderDuration": @(self.debugPanelLastRenderDuration),
                                     @"samplingMode": [self samplingModeName],
                                     @"adaptiveSamplingEnabled": @(self.adaptiveSampling),
+                                    @"maximumDimming": @(self.maximumDimming),
                                     @"maxAnalysisFPS": @(samplingFPS),
                                     @"effectiveAnalysisFPS": @(state.acceptedSampleRate),
                                     @"lastAcceptedSampleAge": @(state.lastAcceptedSampleTimestamp > 0 ? now - state.lastAcceptedSampleTimestamp : -1),
@@ -3050,6 +3163,10 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
 
 - (BOOL)isSoftwareOverlayDisplay:(LumenDisplay *)display {
     return display && [display.brightnessBackendName isEqualToString:self.softwareOverlayBackend.name];
+}
+
+- (float)brightnessByApplyingMaximumDimming:(float)brightness {
+    return LumenClampFloat(brightness, LumenMinimumBrightnessForMaximumDimming(self.maximumDimming), 1.0f);
 }
 
 - (float)overlayTargetBrightnessForLightness:(float)lightness displayKey:(NSString *)displayKey {

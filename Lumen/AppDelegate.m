@@ -19,12 +19,16 @@
 @property (nonatomic, strong) NSTimer *displayStatusTimer;
 @property (strong, nonatomic) NSMenuItem *displayStatusMenuItem;
 @property (strong, nonatomic) NSMenuItem *debugPanelMenuItem;
-@property (strong, nonatomic) NSMenuItem *disableExternalOverlaysMenuItem;
-@property (strong, nonatomic) NSMenuItem *enableExternalOverlaysMenuItem;
+@property (strong, nonatomic) NSMenuItem *externalOverlaysMenuItem;
+@property (strong, nonatomic) NSMenuItem *externalOverlaysEnabledMenuItem;
 @property (strong, nonatomic) NSMenuItem *resetExternalOverlayCalibrationMenuItem;
 @property (strong, nonatomic) NSMenuItem *hideExternalOverlaysForScreenshotMenuItem;
 @property (strong, nonatomic) NSMenuItem *restoreExternalOverlaysMenuItem;
 @property (strong, nonatomic) NSMenuItem *resetCalibrationMenuItem;
+@property (strong, nonatomic) NSMenuItem *maximumDimmingMenuItem;
+@property (strong, nonatomic) NSSlider *maximumDimmingSlider;
+@property (strong, nonatomic) NSTextField *maximumDimmingValueLabel;
+@property (strong, nonatomic) NSMenuItem *samplingMenuItem;
 @property (strong, nonatomic) NSMenuItem *samplingRateMenuItem;
 @property (strong, nonatomic) NSMenuItem *adaptiveSamplingMenuItem;
 @property (strong, nonatomic) NSArray<NSMenuItem *> *samplingRateItems;
@@ -123,49 +127,108 @@
                                                   keyEquivalent:@""];
     self.debugPanelMenuItem.target = self;
     [self.statusMenu insertItem:self.debugPanelMenuItem atIndex:3];
-    self.disableExternalOverlaysMenuItem = [[NSMenuItem alloc] initWithTitle:@"Disable External Overlays"
-                                                                      action:@selector(menuActionDisableExternalOverlays:)
-                                                               keyEquivalent:@""];
-    self.disableExternalOverlaysMenuItem.target = self;
-    [self.statusMenu insertItem:self.disableExternalOverlaysMenuItem atIndex:4];
-    self.enableExternalOverlaysMenuItem = [[NSMenuItem alloc] initWithTitle:@"Enable External Overlays"
-                                                                     action:@selector(menuActionEnableExternalOverlays:)
-                                                              keyEquivalent:@""];
-    self.enableExternalOverlaysMenuItem.target = self;
-    [self.statusMenu insertItem:self.enableExternalOverlaysMenuItem atIndex:5];
-    self.resetExternalOverlayCalibrationMenuItem = [[NSMenuItem alloc] initWithTitle:@"Reset External Overlay Calibration"
-                                                                              action:@selector(menuActionResetExternalOverlayCalibration:)
-                                                                       keyEquivalent:@""];
-    self.resetExternalOverlayCalibrationMenuItem.target = self;
-    [self.statusMenu insertItem:self.resetExternalOverlayCalibrationMenuItem atIndex:6];
-    self.hideExternalOverlaysForScreenshotMenuItem = [[NSMenuItem alloc] initWithTitle:@"Hide External Overlays for Screenshot"
-                                                                                action:@selector(menuActionHideExternalOverlaysForScreenshot:)
-                                                                         keyEquivalent:@"H"];
-    self.hideExternalOverlaysForScreenshotMenuItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption | NSEventModifierFlagShift;
-    self.hideExternalOverlaysForScreenshotMenuItem.target = self;
-    [self.statusMenu insertItem:self.hideExternalOverlaysForScreenshotMenuItem atIndex:7];
-    self.restoreExternalOverlaysMenuItem = [[NSMenuItem alloc] initWithTitle:@"Restore External Overlays"
-                                                                      action:@selector(menuActionRestoreExternalOverlays:)
-                                                               keyEquivalent:@""];
-    self.restoreExternalOverlaysMenuItem.target = self;
-    [self.statusMenu insertItem:self.restoreExternalOverlaysMenuItem atIndex:8];
+
+    self.externalOverlaysMenuItem = [[NSMenuItem alloc] initWithTitle:@"External Overlays" action:nil keyEquivalent:@""];
+    self.externalOverlaysMenuItem.submenu = [[NSMenu alloc] initWithTitle:@"External Overlays"];
+    [self.statusMenu insertItem:self.externalOverlaysMenuItem atIndex:4];
+    [self buildExternalOverlaysMenu];
+
+    [self.statusMenu insertItem:[NSMenuItem separatorItem] atIndex:5];
+    self.maximumDimmingMenuItem = [self buildMaximumDimmingMenuItem];
+    [self.statusMenu insertItem:self.maximumDimmingMenuItem atIndex:6];
+    [self.statusMenu insertItem:[NSMenuItem separatorItem] atIndex:7];
+
+    self.samplingMenuItem = [[NSMenuItem alloc] initWithTitle:@"Sampling" action:nil keyEquivalent:@""];
+    self.samplingMenuItem.submenu = [[NSMenu alloc] initWithTitle:@"Sampling"];
+    [self.statusMenu insertItem:self.samplingMenuItem atIndex:8];
+    [self buildSamplingMenu];
+
     self.resetCalibrationMenuItem = [[NSMenuItem alloc] initWithTitle:@"Reset Learned Calibration"
                                                                action:@selector(menuActionResetLearnedCalibration:)
                                                         keyEquivalent:@""];
     self.resetCalibrationMenuItem.target = self;
     [self.statusMenu insertItem:self.resetCalibrationMenuItem atIndex:9];
-    self.samplingRateMenuItem = [[NSMenuItem alloc] initWithTitle:@"Sampling Rate" action:nil keyEquivalent:@""];
-    self.samplingRateMenuItem.submenu = [[NSMenu alloc] initWithTitle:@"Sampling Rate"];
-    [self.statusMenu insertItem:self.samplingRateMenuItem atIndex:10];
+    [self updateDebugPanelMenuItem];
+    [self updateExternalOverlayMenuItems];
+    [self updateMaximumDimmingMenuItem];
+    [self updateSamplingMenuItems];
+}
+
+- (void)buildExternalOverlaysMenu {
+    NSMenu *menu = self.externalOverlaysMenuItem.submenu;
+    [menu removeAllItems];
+
+    self.externalOverlaysEnabledMenuItem = [[NSMenuItem alloc] initWithTitle:@"Enabled"
+                                                                      action:@selector(menuActionToggleExternalOverlays:)
+                                                               keyEquivalent:@""];
+    self.externalOverlaysEnabledMenuItem.target = self;
+    [menu addItem:self.externalOverlaysEnabledMenuItem];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    self.hideExternalOverlaysForScreenshotMenuItem = [[NSMenuItem alloc] initWithTitle:@"Hide for Screenshot"
+                                                                                action:@selector(menuActionHideExternalOverlaysForScreenshot:)
+                                                                         keyEquivalent:@"H"];
+    self.hideExternalOverlaysForScreenshotMenuItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption | NSEventModifierFlagShift;
+    self.hideExternalOverlaysForScreenshotMenuItem.target = self;
+    [menu addItem:self.hideExternalOverlaysForScreenshotMenuItem];
+
+    self.restoreExternalOverlaysMenuItem = [[NSMenuItem alloc] initWithTitle:@"Restore Now"
+                                                                      action:@selector(menuActionRestoreExternalOverlays:)
+                                                               keyEquivalent:@""];
+    self.restoreExternalOverlaysMenuItem.target = self;
+    [menu addItem:self.restoreExternalOverlaysMenuItem];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    self.resetExternalOverlayCalibrationMenuItem = [[NSMenuItem alloc] initWithTitle:@"Reset Overlay Calibration"
+                                                                              action:@selector(menuActionResetExternalOverlayCalibration:)
+                                                                       keyEquivalent:@""];
+    self.resetExternalOverlayCalibrationMenuItem.target = self;
+    [menu addItem:self.resetExternalOverlayCalibrationMenuItem];
+}
+
+- (NSMenuItem *)buildMaximumDimmingMenuItem {
+    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 260, 62)];
+
+    NSTextField *titleLabel = [NSTextField labelWithString:@"Maximum Dimming"];
+    titleLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
+    titleLabel.frame = NSMakeRect(14, 38, 150, 17);
+    [container addSubview:titleLabel];
+
+    self.maximumDimmingValueLabel = [NSTextField labelWithString:@""];
+    self.maximumDimmingValueLabel.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
+    self.maximumDimmingValueLabel.alignment = NSTextAlignmentRight;
+    self.maximumDimmingValueLabel.textColor = [NSColor secondaryLabelColor];
+    self.maximumDimmingValueLabel.frame = NSMakeRect(172, 38, 74, 17);
+    [container addSubview:self.maximumDimmingValueLabel];
+
+    self.maximumDimmingSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(12, 11, 236, 22)];
+    self.maximumDimmingSlider.minValue = 0.0;
+    self.maximumDimmingSlider.maxValue = [self.brightnessController maximumDimmingLimit];
+    self.maximumDimmingSlider.continuous = YES;
+    self.maximumDimmingSlider.target = self;
+    self.maximumDimmingSlider.action = @selector(menuActionMaximumDimmingChanged:);
+    [container addSubview:self.maximumDimmingSlider];
+
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+    item.view = container;
+    return item;
+}
+
+- (void)buildSamplingMenu {
+    NSMenu *menu = self.samplingMenuItem.submenu;
+    [menu removeAllItems];
+
+    self.samplingRateMenuItem = [[NSMenuItem alloc] initWithTitle:@"Rate" action:nil keyEquivalent:@""];
+    self.samplingRateMenuItem.submenu = [[NSMenu alloc] initWithTitle:@"Rate"];
+    [menu addItem:self.samplingRateMenuItem];
     [self buildSamplingRateMenu];
+    [menu addItem:[NSMenuItem separatorItem]];
+
     self.adaptiveSamplingMenuItem = [[NSMenuItem alloc] initWithTitle:@"Adaptive Sampling"
                                                                action:@selector(menuActionToggleAdaptiveSampling:)
                                                         keyEquivalent:@""];
     self.adaptiveSamplingMenuItem.target = self;
-    [self.statusMenu insertItem:self.adaptiveSamplingMenuItem atIndex:11];
-    [self updateDebugPanelMenuItem];
-    [self updateExternalOverlayMenuItems];
-    [self updateSamplingMenuItems];
+    [menu addItem:self.adaptiveSamplingMenuItem];
 }
 
 - (void)buildSamplingRateMenu {
@@ -235,6 +298,11 @@
     [self updateExternalOverlayMenuItems];
 }
 
+- (IBAction)menuActionToggleExternalOverlays:(id)sender {
+    [self.brightnessController setExternalSoftwareDimmingEnabled:![self.brightnessController externalSoftwareDimmingEnabled]];
+    [self updateExternalOverlayMenuItems];
+}
+
 - (IBAction)menuActionResetExternalOverlayCalibration:(id)sender {
     [self.brightnessController resetExternalOverlayCalibration];
 }
@@ -275,10 +343,10 @@
 
 - (void)updateExternalOverlayMenuItems {
     BOOL enabled = [self.brightnessController externalSoftwareDimmingEnabled];
-    self.disableExternalOverlaysMenuItem.enabled = enabled;
-    self.enableExternalOverlaysMenuItem.enabled = !enabled;
-    self.disableExternalOverlaysMenuItem.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
-    self.enableExternalOverlaysMenuItem.state = enabled ? NSControlStateValueOff : NSControlStateValueOn;
+    self.externalOverlaysMenuItem.title = enabled ? @"External Overlays: On" : @"External Overlays: Off";
+    self.externalOverlaysEnabledMenuItem.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
+    self.hideExternalOverlaysForScreenshotMenuItem.enabled = enabled;
+    self.restoreExternalOverlaysMenuItem.enabled = enabled;
 }
 
 - (void)updateSamplingMenuItems {
@@ -287,7 +355,8 @@
         double fps = [item.representedObject doubleValue];
         item.state = fabs(currentFPS - fps) < 0.01 ? NSControlStateValueOn : NSControlStateValueOff;
     }
-    self.samplingRateMenuItem.title = [NSString stringWithFormat:@"Sampling Rate: %@", [self.brightnessController samplingModeName]];
+    self.samplingMenuItem.title = [NSString stringWithFormat:@"Sampling: %@", [self.brightnessController samplingModeName]];
+    self.samplingRateMenuItem.title = [NSString stringWithFormat:@"Rate: %@", [self.brightnessController samplingModeName]];
     self.adaptiveSamplingMenuItem.state = [self.brightnessController adaptiveSamplingEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
 }
 
@@ -321,11 +390,24 @@
     [self updateSamplingMenuItems];
 }
 
+- (IBAction)menuActionMaximumDimmingChanged:(NSSlider *)sender {
+    [self.brightnessController setMaximumDimming:sender.floatValue];
+    [self updateMaximumDimmingMenuItem];
+}
+
+- (void)updateMaximumDimmingMenuItem {
+    float maximumDimming = [self.brightnessController maximumDimming];
+    self.maximumDimmingSlider.maxValue = [self.brightnessController maximumDimmingLimit];
+    self.maximumDimmingSlider.floatValue = maximumDimming;
+    self.maximumDimmingValueLabel.stringValue = [NSString stringWithFormat:@"%.0f%%", maximumDimming * 100.0f];
+}
+
 - (void)displayStatusTick:(NSTimer *)timer {
     if ([self screenshotUIIsRunning]) {
         [self.brightnessController temporarilyHideExternalOverlaysForScreenshot];
     }
     [self updateExternalOverlayMenuItems];
+    [self updateMaximumDimmingMenuItem];
     [self updateSamplingMenuItems];
     [self updateDisplayStatusMenu];
 }

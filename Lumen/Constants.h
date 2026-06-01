@@ -23,6 +23,7 @@
 #define DEFAULTS_DEBUG_PANEL_VISIBLE (@"debugPanelVisible")
 #define DEFAULTS_SAMPLING_FPS (@"samplingFPS")
 #define DEFAULTS_ADAPTIVE_SAMPLING_ENABLED (@"adaptiveSamplingEnabled")
+#define DEFAULTS_MAXIMUM_DIMMING (@"maximumDimming")
 
 #define NOTIFICATION_IGNORE_LIST_CHANGED (@"notification.ignoreListChanged")
 

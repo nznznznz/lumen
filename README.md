@@ -57,7 +57,7 @@ Feature requests, bug reports, and pull requests are all appreciated.
 To build locally, run:
 
 ```bash
-xcodebuild -project Lumen.xcodeproj -scheme Lumen -configuration Debug -derivedDataPath /tmp/lumen-derived build
+xcodebuild -project Lumen.xcodeproj -scheme Lumen -configuration Debug -derivedDataPath ./DerivedData build
 ```
 
 ## Related Projects

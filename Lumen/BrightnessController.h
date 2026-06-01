@@ -36,5 +36,8 @@
 - (NSString *)samplingModeName;
 - (BOOL)adaptiveSamplingEnabled;
 - (void)setAdaptiveSamplingEnabled:(BOOL)enabled;
+- (float)maximumDimming;
+- (float)maximumDimmingLimit;
+- (void)setMaximumDimming:(float)maximumDimming;
 
 @end
