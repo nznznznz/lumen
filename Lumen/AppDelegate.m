@@ -235,10 +235,10 @@
     NSMenu *menu = self.samplingRateMenuItem.submenu;
     [menu removeAllItems];
     NSArray<NSDictionary<NSString *, id> *> *items = @[
-        @{@"title": @"Low Power: 0.5 fps", @"fps": @0.5},
-        @{@"title": @"Balanced: 1 fps", @"fps": @1.0},
-        @{@"title": @"Responsive: 2 fps", @"fps": @2.0},
-        @{@"title": @"High: 4 fps", @"fps": @4.0},
+        @{@"title": @"Low: 4 fps", @"fps": @4.0},
+        @{@"title": @"Medium: 8 fps", @"fps": @8.0},
+        @{@"title": @"High: 12 fps", @"fps": @12.0},
+        @{@"title": @"Ultra: 16 fps", @"fps": @16.0},
     ];
     NSMutableArray<NSMenuItem *> *rateItems = [NSMutableArray new];
     for (NSDictionary<NSString *, id> *itemInfo in items) {
@@ -368,7 +368,7 @@
 - (IBAction)menuActionSetCustomSamplingRate:(id)sender {
     NSAlert *alert = [NSAlert new];
     alert.messageText = @"Custom sampling FPS";
-    alert.informativeText = @"Enter a maximum analysis rate from 0.2 to 4 fps.";
+    alert.informativeText = @"Enter a maximum analysis rate from 0.2 to 16 fps.";
     NSTextField *input = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 180, 24)];
     input.stringValue = [NSString stringWithFormat:@"%.2f", [self.brightnessController samplingFPS]];
     alert.accessoryView = input;

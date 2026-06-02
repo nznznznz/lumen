@@ -40,6 +40,9 @@ static float const LumenOverlayDefaultBrightLStar = 90.0f;
 static float const LumenOverlayDefaultDarkBrightness = 1.00f;
 static float const LumenOverlayDefaultBrightBrightness = 0.55f;
 static float const LumenOverlayManualStep = 0.05f;
+static float const LumenOverlayTransitionImmediateFraction = 0.80f;
+static NSTimeInterval const LumenOverlayTransitionDuration = 0.18;
+static NSTimeInterval const LumenOverlayTransitionFrameInterval = 1.0 / 60.0;
 static NSTimeInterval const LumenOverlayScreenshotHideDuration = 10.0;
 static NSString * const LumenExternalSoftwareDimmingEnabledKey = @"externalSoftwareDimmingEnabled";
 static NSTimeInterval const LumenActiveSampleInterval = 0.5;
@@ -50,9 +53,10 @@ static NSTimeInterval const LumenForcedHeavyAnalysisInterval = 8.0;
 static double const LumenLightnessDeltaThreshold = 0.5;
 static double const LumenCheapChangeThreshold = 0.03;
 static float const LumenOverlayAlphaDeltaThreshold = 0.005f;
-static double const LumenDefaultSamplingFPS = 2.0;
+static double const LumenDefaultSamplingFPS = 12.0;
 static double const LumenMinimumSamplingFPS = 0.2;
-static double const LumenMaximumSamplingFPS = 4.0;
+static double const LumenMaximumSamplingFPS = 16.0;
+static double const LumenCaptureFPS = 16.0;
 static NSUInteger const LumenCheapFingerprintGridWidth = 32;
 static NSUInteger const LumenCheapFingerprintGridHeight = 18;
 static NSUInteger const LumenLightnessSampleGridWidth = 80;
@@ -125,6 +129,7 @@ static os_log_t LumenDebugLog(void) {
 @property (nonatomic, assign) NSTimeInterval lastUpdateTime;
 @property (nonatomic, assign) NSUInteger overlayUpdatesSkipped;
 @property (nonatomic, assign) NSTimeInterval lastOverlayUpdateDuration;
+@property (nonatomic, assign) NSUInteger transitionGeneration;
 @property (nonatomic, strong) NSPanel *panel;
 
 @end
@@ -149,6 +154,7 @@ static os_log_t LumenDebugLog(void) {
 - (void)setEnabled:(BOOL)enabled;
 - (void)temporarilyHideForScreenshot;
 - (void)restoreOverlays;
+- (void)setOverlayAlpha:(float)alpha forState:(LumenSoftwareOverlayState *)state final:(BOOL)final;
 
 @end
 
@@ -858,6 +864,7 @@ static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char 
         state.hiddenReason = @"";
         state.overlayUpdatesSkipped = 0;
         state.lastOverlayUpdateDuration = 0;
+        state.transitionGeneration = 0;
         self.statesByDisplayKey[display.stableKey] = state;
     }
     return state;
@@ -872,9 +879,11 @@ static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char 
         NSTimeInterval startedAt = [NSDate timeIntervalSinceReferenceDate];
         BOOL hidden = state.temporarilyHiddenForScreenshot;
         state.overlayEnabled = self.enabled;
-        state.appliedOverlayAlpha = (self.enabled && !hidden && !remove) ? state.desiredOverlayAlpha : 0.0f;
+        float targetAlpha = (self.enabled && !hidden && !remove) ? state.desiredOverlayAlpha : 0.0f;
 
         if (remove || !self.enabled || hidden) {
+            state.transitionGeneration++;
+            state.appliedOverlayAlpha = 0.0f;
             [state.panel orderOut:nil];
             if (remove) {
                 [state.panel close];
@@ -916,11 +925,35 @@ static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char 
         state.panel.sharingType = NSWindowSharingNone;
         [state.panel setFrame:NSRectFromCGRect(state.frame) display:NO];
         state.panel.contentView.frame = NSMakeRect(0, 0, state.frame.size.width, state.frame.size.height);
-        state.panel.contentView.layer.backgroundColor = [[NSColor colorWithCalibratedWhite:0.0 alpha:state.appliedOverlayAlpha] CGColor];
-        if (state.appliedOverlayAlpha <= 0.001f) {
-            [state.panel orderOut:nil];
-        } else {
-            [state.panel orderFrontRegardless];
+        if (state.appliedOverlayAlpha <= 0.001f && targetAlpha <= 0.001f) {
+            [self setOverlayAlpha:0.0f forState:state final:YES];
+            state.lastOverlayUpdateDuration = [NSDate timeIntervalSinceReferenceDate] - startedAt;
+            return;
+        }
+
+        float startAlpha = state.appliedOverlayAlpha;
+        float delta = targetAlpha - startAlpha;
+        if (fabsf(delta) <= LumenOverlayAlphaDeltaThreshold) {
+            [self setOverlayAlpha:targetAlpha forState:state final:YES];
+            state.lastOverlayUpdateDuration = [NSDate timeIntervalSinceReferenceDate] - startedAt;
+            return;
+        }
+
+        NSUInteger generation = ++state.transitionGeneration;
+        float immediateAlpha = startAlpha + (delta * LumenOverlayTransitionImmediateFraction);
+        [self setOverlayAlpha:immediateAlpha forState:state final:NO];
+
+        NSUInteger frameCount = MAX(1, (NSUInteger)ceil(LumenOverlayTransitionDuration / LumenOverlayTransitionFrameInterval));
+        for (NSUInteger frame = 1; frame <= frameCount; frame++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((double)frame * LumenOverlayTransitionFrameInterval * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (state.transitionGeneration != generation) {
+                    return;
+                }
+                double progress = (double)frame / (double)frameCount;
+                double eased = 1.0 - pow(1.0 - progress, 2.0);
+                float alpha = immediateAlpha + ((targetAlpha - immediateAlpha) * (float)eased);
+                [self setOverlayAlpha:alpha forState:state final:(frame == frameCount)];
+            });
         }
         state.lastOverlayUpdateDuration = [NSDate timeIntervalSinceReferenceDate] - startedAt;
     };
@@ -929,6 +962,19 @@ static NSNumber *LumenNumberFromDictionary(NSDictionary *dictionary, const char 
         updateWindow();
     } else {
         dispatch_async(dispatch_get_main_queue(), updateWindow);
+    }
+}
+
+- (void)setOverlayAlpha:(float)alpha forState:(LumenSoftwareOverlayState *)state final:(BOOL)final {
+    float clampedAlpha = LumenClampFloat(alpha, 0.0f, self.maxOverlayAlpha);
+    state.appliedOverlayAlpha = clampedAlpha;
+    state.panel.contentView.layer.backgroundColor = [[NSColor colorWithCalibratedWhite:0.0 alpha:clampedAlpha] CGColor];
+    if (clampedAlpha <= 0.001f) {
+        if (final) {
+            [state.panel orderOut:nil];
+        }
+    } else {
+        [state.panel orderFrontRegardless];
     }
 }
 
@@ -1715,6 +1761,17 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         self.processingSampleDisplayKeys = [NSMutableSet new];
         NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
         double savedFPS = [defaults doubleForKey:DEFAULTS_SAMPLING_FPS];
+        if ([defaults objectForKey:DEFAULTS_SAMPLING_PRESETS_MIGRATED] == nil && savedFPS > 0) {
+            if (fabs(savedFPS - 0.5) < 0.01) {
+                savedFPS = 4.0;
+            } else if (fabs(savedFPS - 1.0) < 0.01) {
+                savedFPS = 8.0;
+            } else if (fabs(savedFPS - 2.0) < 0.01 || fabs(savedFPS - 4.0) < 0.01) {
+                savedFPS = 12.0;
+            }
+            [defaults setDouble:savedFPS forKey:DEFAULTS_SAMPLING_FPS];
+            [defaults setBool:YES forKey:DEFAULTS_SAMPLING_PRESETS_MIGRATED];
+        }
         self.configuredSamplingFPS = savedFPS > 0 ? LumenClampDouble(savedFPS, LumenMinimumSamplingFPS, LumenMaximumSamplingFPS) : LumenDefaultSamplingFPS;
         NSNumber *savedMaximumDimming = [defaults objectForKey:DEFAULTS_MAXIMUM_DIMMING];
         _maximumDimming = savedMaximumDimming ? LumenClampMaximumDimming(savedMaximumDimming.floatValue) : LumenOverlayDefaultMaxAlpha;
@@ -1793,17 +1850,17 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
 
 - (NSString *)samplingModeName {
     double fps = [self samplingFPS];
-    if (fabs(fps - 0.5) < 0.01) {
-        return @"Low Power";
-    }
-    if (fabs(fps - 1.0) < 0.01) {
-        return @"Balanced";
-    }
-    if (fabs(fps - 2.0) < 0.01) {
-        return @"Responsive";
-    }
     if (fabs(fps - 4.0) < 0.01) {
+        return @"Low";
+    }
+    if (fabs(fps - 8.0) < 0.01) {
+        return @"Medium";
+    }
+    if (fabs(fps - 12.0) < 0.01) {
         return @"High";
+    }
+    if (fabs(fps - 16.0) < 0.01) {
+        return @"Ultra";
     }
     return @"Custom";
 }
@@ -2025,7 +2082,7 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
     SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
     config.width = MAX(1, captureDisplay.width / LINEAR_SUBSAMPLE);
     config.height = MAX(1, captureDisplay.height / LINEAR_SUBSAMPLE);
-    config.minimumFrameInterval = CMTimeMakeWithSeconds(1.0 / LumenMaximumSamplingFPS, 600);
+    config.minimumFrameInterval = CMTimeMakeWithSeconds(1.0 / LumenCaptureFPS, 600);
     config.pixelFormat = kCVPixelFormatType_32BGRA;
     config.showsCursor = NO;
     config.capturesAudio = NO;
@@ -3527,13 +3584,24 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
 }
 
 - (void)processSampleBuffer:(CMSampleBufferRef)sampleBuffer displayKey:(NSString *)displayKey arrivedAt:(NSTimeInterval)sampleArrivedAt processingReserved:(BOOL)processingReserved {
+    NSData *fingerprint = [self cheapFingerprintFromSampleBuffer:sampleBuffer];
+    __block NSData *previousFingerprint = nil;
+    @synchronized (self.lastAcceptedSampleTimeByDisplayKey) {
+        previousFingerprint = self.cheapFingerprintByDisplayKey[displayKey];
+    }
+    double cheapDelta = [self cheapDeltaFromFingerprint:fingerprint previousFingerprint:previousFingerprint];
+    BOOL meaningfulChange = !isfinite(cheapDelta) || cheapDelta >= LumenCheapChangeThreshold;
+
     __block BOOL shouldThrottle = NO;
     @synchronized (self.lastAcceptedSampleTimeByDisplayKey) {
         NSTimeInterval lastAccepted = self.lastAcceptedSampleTimeByDisplayKey[displayKey].doubleValue;
         NSTimeInterval targetInterval = [self minimumAnalysisIntervalForDisplayKey:displayKey];
-        shouldThrottle = lastAccepted > 0 && sampleArrivedAt - lastAccepted < targetInterval;
+        shouldThrottle = lastAccepted > 0 && sampleArrivedAt - lastAccepted < targetInterval && !meaningfulChange;
         if (!shouldThrottle) {
             self.lastAcceptedSampleTimeByDisplayKey[displayKey] = @(sampleArrivedAt);
+            if (fingerprint) {
+                self.cheapFingerprintByDisplayKey[displayKey] = fingerprint;
+            }
         }
     }
 
@@ -3541,29 +3609,23 @@ static UInt8 const LumenArmDDC7BitAddress = 0x37;
         dispatch_async(self.controllerQueue, ^{
             LumenDisplayState *state = self.displayStatesByKey[displayKey];
             [self recordCaptureCallbackForState:state atTime:sampleArrivedAt dropped:YES];
+            state.lastCheapChangeDelta = isfinite(cheapDelta) ? cheapDelta : 0;
             [self finishProcessingSampleForDisplayKey:displayKey];
         });
         return;
     }
 
-    NSData *fingerprint = [self cheapFingerprintFromSampleBuffer:sampleBuffer];
-    __block NSData *previousFingerprint = nil;
-    @synchronized (self.lastAcceptedSampleTimeByDisplayKey) {
-        previousFingerprint = self.cheapFingerprintByDisplayKey[displayKey];
-        if (fingerprint) {
-            self.cheapFingerprintByDisplayKey[displayKey] = fingerprint;
-        }
-    }
-    double cheapDelta = [self cheapDeltaFromFingerprint:fingerprint previousFingerprint:previousFingerprint];
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    __block BOOL shouldRunHeavyAnalysis = !isfinite(cheapDelta) || cheapDelta >= LumenCheapChangeThreshold;
+    __block BOOL shouldRunHeavyAnalysis = meaningfulChange || !self.adaptiveSampling;
     __block BOOL forcedRefresh = NO;
-    dispatch_sync(self.controllerQueue, ^{
-        LumenDisplayState *state = self.displayStatesByKey[displayKey];
-        NSTimeInterval lastHeavy = state.lastHeavyAnalysisTime;
-        forcedRefresh = lastHeavy <= 0 || now - lastHeavy >= LumenForcedHeavyAnalysisInterval;
-        shouldRunHeavyAnalysis = shouldRunHeavyAnalysis || forcedRefresh || !self.adaptiveSampling;
-    });
+    if (!shouldRunHeavyAnalysis) {
+        dispatch_sync(self.controllerQueue, ^{
+            LumenDisplayState *state = self.displayStatesByKey[displayKey];
+            NSTimeInterval lastHeavy = state.lastHeavyAnalysisTime;
+            forcedRefresh = lastHeavy <= 0 || now - lastHeavy >= LumenForcedHeavyAnalysisInterval;
+            shouldRunHeavyAnalysis = forcedRefresh;
+        });
+    }
 
     if (!shouldRunHeavyAnalysis) {
         dispatch_async(self.controllerQueue, ^{
