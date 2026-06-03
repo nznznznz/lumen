@@ -96,19 +96,26 @@ static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
         @{@"title": @"Capture", @"key": @"capture"},
         @{@"title": @"Sampling Mode", @"key": @"samplingMode"},
         @{@"title": @"Max Analysis FPS", @"key": @"maxAnalysisFPS"},
+        @{@"title": @"Capture Stream FPS", @"key": @"captureStreamFPS"},
         @{@"title": @"Effective Analysis FPS", @"key": @"effectiveAnalysisFPS"},
         @{@"title": @"Last Accepted Sample Age", @"key": @"lastAcceptedSampleAge"},
         @{@"title": @"Dropped Frames", @"key": @"droppedFrames"},
         @{@"title": @"Coalesced Frames", @"key": @"coalescedFrames"},
         @{@"title": @"Cheap Change Delta", @"key": @"cheapChangeDelta"},
+        @{@"title": @"Cheap Fingerprint Duration", @"key": @"lastCheapFingerprintDuration"},
         @{@"title": @"Last Heavy Analysis Duration", @"key": @"lastHeavyAnalysisDuration"},
         @{@"title": @"Heavy Analyses Skipped", @"key": @"heavyAnalysesSkipped"},
+        @{@"title": @"Sample Processing Duration", @"key": @"lastSampleProcessingDuration"},
+        @{@"title": @"Controller Queue Wait", @"key": @"lastControllerQueueWaitDuration"},
         @{@"title": @"Forced Refresh Interval", @"key": @"forcedRefreshInterval"},
         @{@"title": @"Capture Rate", @"key": @"captureRate"},
         @{@"title": @"Accepted Sample Rate", @"key": @"acceptedSampleRate"},
         @{@"title": @"Dropped Samples", @"key": @"droppedSampleCount"},
         @{@"title": @"Last Lightness Compute Duration", @"key": @"lastLightnessComputeDuration"},
         @{@"title": @"Last Control Loop Duration", @"key": @"lastControlLoopDuration"},
+        @{@"title": @"Snapshot Generation Duration", @"key": @"snapshotGenerationDuration"},
+        @{@"title": @"Debug Snapshot Requests", @"key": @"debugSnapshotRequests"},
+        @{@"title": @"Debug Snapshots Skipped", @"key": @"debugSnapshotsSkipped"},
         @{@"title": @"Debug Refresh Rate", @"key": @"debugRefreshRate"},
         @{@"title": @"Last Debug Render Duration", @"key": @"debugPanelLastRenderDuration"},
         @{@"title": @"Lightness L*", @"key": @"lightnessLStar"},
@@ -124,11 +131,16 @@ static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
         @{@"title": @"Overlay Applied Alpha", @"key": @"overlayAppliedAlpha"},
         @{@"title": @"Overlay Updates Skipped", @"key": @"overlayUpdatesSkipped"},
         @{@"title": @"Last Overlay Update Duration", @"key": @"lastOverlayUpdateDuration"},
+        @{@"title": @"Last Overlay Transition Duration", @"key": @"lastOverlayTransitionDuration"},
+        @{@"title": @"Overlay Transition Animations", @"key": @"overlayTransitionAnimationCount"},
+        @{@"title": @"Overlay Transition Cancels", @"key": @"overlayTransitionCancelledCount"},
         @{@"title": @"Temporarily Hidden", @"key": @"overlayTemporarilyHidden"},
         @{@"title": @"Hidden Reason", @"key": @"overlayHiddenReason"},
         @{@"title": @"Hidden Until", @"key": @"overlayHiddenUntil"},
         @{@"title": @"Screenshot Safe Mode", @"key": @"screenshotSafeMode"},
         @{@"title": @"Window Sharing Type", @"key": @"overlayWindowSharingType"},
+        @{@"title": @"Overlay Window Visible", @"key": @"overlayWindowVisible"},
+        @{@"title": @"Overlay Window Level", @"key": @"overlayWindowLevel"},
         @{@"title": @"Ignores Mouse Events", @"key": @"overlayIgnoresMouseEvents"},
         @{@"title": @"Can Become Key/Main", @"key": @"overlayCanBecomeKeyMain"},
         @{@"title": @"Action", @"key": @"action"},
@@ -193,8 +205,8 @@ static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
 
 - (void)showPanel {
     self.lastRenderedSnapshotToken = nil;
-    [self refreshFromLatestSnapshot];
     [self.window makeKeyAndOrderFront:nil];
+    [self refreshFromLatestSnapshot];
     [self startRefreshTimer];
     [self notifyVisibilityChanged];
 }
@@ -527,6 +539,7 @@ static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
         if ([metric isEqualToString:@"captureRate"] ||
             [metric isEqualToString:@"acceptedSampleRate"] ||
             [metric isEqualToString:@"maxAnalysisFPS"] ||
+            [metric isEqualToString:@"captureStreamFPS"] ||
             [metric isEqualToString:@"effectiveAnalysisFPS"] ||
             [metric isEqualToString:@"debugRefreshRate"]) {
             if ([metric isEqualToString:@"debugRefreshRate"]) {
@@ -538,16 +551,26 @@ static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
             [metric isEqualToString:@"droppedFrames"] ||
             [metric isEqualToString:@"coalescedFrames"] ||
             [metric isEqualToString:@"heavyAnalysesSkipped"] ||
-            [metric isEqualToString:@"overlayUpdatesSkipped"]) {
+            [metric isEqualToString:@"overlayUpdatesSkipped"] ||
+            [metric isEqualToString:@"debugSnapshotRequests"] ||
+            [metric isEqualToString:@"debugSnapshotsSkipped"] ||
+            [metric isEqualToString:@"overlayTransitionAnimationCount"] ||
+            [metric isEqualToString:@"overlayTransitionCancelledCount"] ||
+            [metric isEqualToString:@"overlayWindowLevel"]) {
             return [self formattedInteger:display[metric]];
         }
         if ([metric isEqualToString:@"lastLightnessComputeDuration"] ||
             [metric isEqualToString:@"lastHeavyAnalysisDuration"] ||
+            [metric isEqualToString:@"lastCheapFingerprintDuration"] ||
+            [metric isEqualToString:@"lastSampleProcessingDuration"] ||
+            [metric isEqualToString:@"lastControllerQueueWaitDuration"] ||
             [metric isEqualToString:@"lastControlLoopDuration"] ||
+            [metric isEqualToString:@"snapshotGenerationDuration"] ||
             [metric isEqualToString:@"debugPanelLastRenderDuration"] ||
             [metric isEqualToString:@"lastAcceptedSampleAge"] ||
             [metric isEqualToString:@"forcedRefreshInterval"] ||
-            [metric isEqualToString:@"lastOverlayUpdateDuration"]) {
+            [metric isEqualToString:@"lastOverlayUpdateDuration"] ||
+            [metric isEqualToString:@"lastOverlayTransitionDuration"]) {
             return [self formattedSeconds:display[metric]];
         }
         if ([metric isEqualToString:@"cheapChangeDelta"]) {
@@ -602,6 +625,7 @@ static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
             [metric isEqualToString:@"controllable"] ||
             [metric isEqualToString:@"overlayEnabled"] ||
             [metric isEqualToString:@"overlayTemporarilyHidden"] ||
+            [metric isEqualToString:@"overlayWindowVisible"] ||
             [metric isEqualToString:@"overlayIgnoresMouseEvents"] ||
             [metric isEqualToString:@"ddcRateLimited"]) {
             return [self yesNoOrDash:display[metric]];
@@ -721,13 +745,8 @@ static NSTimeInterval const LumenDebugPanelRefreshInterval = 1.0;
 }
 
 - (void)copyDebugState:(id)sender {
-    NSDictionary *snapshot = [self.brightnessController debugSnapshot];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSError *error = nil;
-        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:snapshot
-                                                           options:NSJSONWritingPrettyPrinted
-                                                             error:&error];
-        NSString *text = jsonData && !error ? [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding] : [snapshot description];
+        NSString *text = [self.brightnessController debugSnapshotText];
         dispatch_async(dispatch_get_main_queue(), ^{
             NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
             [pasteboard clearContents];
